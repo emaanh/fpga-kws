@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+data/
+checkpoints/
+*.jou
+*.log
+.Xil/
+build/
+*.result.xml
