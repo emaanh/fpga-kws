@@ -11,8 +11,8 @@
 //   PW    64 taps (one per input channel), that channel's value broadcast to all lanes
 // The pipeline drains between groups so bias/shift can change safely.
 //
-// Pipeline:  S0 issue -> S1 mem addr -> S2 mem data, operand select -> S3 multiply
-//            -> S4 accumulate (+ rounding) -> S5 shift, clamp -> S6 write (+ pool on last layer)
+// Pipeline:  S0 issue -> C coordinates -> S1 mem addr -> S2 mem data, operand select
+//            -> S3 multiply -> S4 accumulate -> S5 shift, clamp -> S6 write (+ pool on last layer)
 
 `ifndef KWS_MEM_DIR
 `define KWS_MEM_DIR ""
@@ -43,7 +43,7 @@ module kws_engine
   localparam int LAST    = N_LAYERS - 1;
 
   typedef enum logic [2:0] {
-    S_IDLE, S_SETUP, S_RUN, S_DRAIN, S_FC, S_FC_DRAIN, S_DONE
+    S_IDLE, S_SETUP, S_SETUP2, S_RUN, S_DRAIN, S_FC, S_FC_DRAIN, S_DONE
   } state_t;
 
   state_t state;
@@ -54,30 +54,35 @@ module kws_engine
   logic [3:0] layer;
   logic [1:0] grp;
   logic [4:0] oh, ow;   // output pixel
-  logic [5:0] tap;      // weight index within (layer, group): kh*KW + kw, or input channel
+  logic [8:0] pix;      // oh * OUT_W + ow
+  logic [5:0] tap;     // weight index within (layer, group): kh*KW + kw, or input channel
   logic [3:0] kh;
   logic [1:0] kw;
   logic       layer_done;  // pulse after each layer fully written (testbench hook)
+  logic [$clog2(WROM_WORDS)-1:0]      w_base;   // weight ROM word of tap 0 for (layer, group)
+  logic [$clog2(N_LAYERS*GROUPS)-1:0] bs_addr;  // bias/shift ROM word for (layer, group)
 
+  // Per-layer constants, registered in S_SETUP to keep the table lookup off the counter paths.
   layer_kind_t kind;
   logic [5:0]  last_tap;
   logic [1:0]  last_kw;
-  assign kind = LAYER_KIND[layer];
 
-  always_comb begin
-    unique case (kind)
-      L_STEM:  begin last_tap = 6'd39; last_kw = 2'd3; end
-      L_DW:    begin last_tap = 6'd8;  last_kw = 2'd2; end
-      default: begin last_tap = 6'd63; last_kw = 2'd0; end
-    endcase
+  always_ff @(posedge clk) begin
+    if (state == S_SETUP) begin
+      kind <= LAYER_KIND[layer];
+      unique case (LAYER_KIND[layer])
+        L_STEM:  begin last_tap <= 6'd39; last_kw <= 2'd3; end
+        L_DW:    begin last_tap <= 6'd8;  last_kw <= 2'd2; end
+        default: begin last_tap <= 6'd63; last_kw <= 2'd0; end
+      endcase
+    end
   end
 
   // ---------------------------------------------------------------------------------------
-  // S0: input coordinates, padding and addresses for the current tap
+  // S0: input coordinates and padding for the current tap (addresses are formed in S1)
   // ---------------------------------------------------------------------------------------
   logic signed [7:0] oh_s, ow_s, kh_s, kw_s, ih, iw;
   logic              pad;
-  logic [15:0]       feat_addr, act_addr, w_addr, out_addr;
   logic [1:0]        in_grp;
 
   assign oh_s = 8'(oh);
@@ -103,11 +108,7 @@ module kws_engine
         pad = 1'b0;
       end
     endcase
-    in_grp    = kind == L_PW ? tap[5:4] : grp;
-    feat_addr = 16'(ih * IN_W + iw);
-    act_addr  = 16'((ih * OUT_W + iw) * GROUPS + in_grp);
-    w_addr    = 16'(LAYER_WBASE[layer] + grp * (last_tap + 1) + tap);
-    out_addr  = 16'((oh * OUT_W + ow) * GROUPS + grp);
+    in_grp = kind == L_PW ? tap[5:4] : grp;
   end
 
   // ---------------------------------------------------------------------------------------
@@ -142,21 +143,43 @@ module kws_engine
 
   sdp_ram #(.WIDTH(8 * LANES), .DEPTH(WROM_WORDS), .INIT({MEM_DIR, "weights.hex"})) u_wrom (
     .clk, .we(1'b0), .waddr('0), .wdata('0), .raddr(wrom_raddr), .rdata(wrom_rdata));
-  // Bias and shift ROMs are addressed by (layer, group) and stay stable while a group runs.
+  // Bias and shift ROMs: one word per (layer, group), read during S_SETUP.
   sdp_ram #(.WIDTH(32 * LANES), .DEPTH(N_LAYERS * GROUPS), .INIT({MEM_DIR, "bias.hex"})) u_bias (
     .clk, .we(1'b0), .waddr('0), .wdata('0),
-    .raddr(BS_AW'(layer * GROUPS + grp)), .rdata(bias_rdata));
+    .raddr(bs_addr), .rdata(bias_rdata));
   sdp_ram #(.WIDTH(4 * LANES), .DEPTH(N_LAYERS * GROUPS), .INIT({MEM_DIR, "shift.hex"})) u_shift (
     .clk, .we(1'b0), .waddr('0), .wdata('0),
-    .raddr(BS_AW'(layer * GROUPS + grp)), .rdata(shift_rdata));
-  sdp_ram #(.WIDTH(8), .DEPTH(N_CLASSES * CHANNELS), .INIT({MEM_DIR, "fc_w.hex"})) u_fcw (
+    .raddr(bs_addr), .rdata(shift_rdata));
+  sdp_ram #(.WIDTH(8), .DEPTH(N_CLASSES * CHANNELS), .INIT({MEM_DIR, "fc_w.hex"}), .STYLE("block")) u_fcw (
     .clk, .we(1'b0), .waddr('0), .wdata('0), .raddr(fcw_raddr), .rdata(fcw_rdata));
   sdp_ram #(.WIDTH(32), .DEPTH(N_CLASSES), .INIT({MEM_DIR, "fc_b.hex"})) u_fcb (
     .clk, .we(1'b0), .waddr('0), .wdata('0), .raddr(fcb_raddr), .rdata(fcb_rdata));
 
   // ---------------------------------------------------------------------------------------
+  // Per-(layer, group) constants, latched in S_SETUP2. The weight ROM is laid out layer by
+  // layer, group by group, so both ROM bases just advance by one block per group.
+  // ---------------------------------------------------------------------------------------
+  logic signed [31:0] bias_rnd [LANES];  // bias + rounding constant 2^(shift-1), from bias.hex
+  logic [3:0]         shift    [LANES];
+
+  always_ff @(posedge clk) begin
+    if (state == S_SETUP2) begin
+      for (int i = 0; i < LANES; i++) begin
+        shift[i]    <= shift_rdata[4*i +: 4];
+        bias_rnd[i] <= $signed(bias_rdata[32*i +: 32]);
+      end
+    end
+  end
+
+  // ---------------------------------------------------------------------------------------
   // Conv pipeline
   // ---------------------------------------------------------------------------------------
+  logic              c_valid, c_first, c_last, c_pad;
+  logic [3:0]        c_lane;
+  logic signed [7:0] c_ih, c_iw;
+  logic [1:0]        c_in_grp;
+  logic [5:0]        c_tap;
+  logic [ACT_AW-1:0] c_addr;
   logic              s1_valid, s1_first, s1_last, s1_pad;
   logic [3:0]        s1_lane;
   logic [ACT_AW-1:0] s1_addr;
@@ -176,32 +199,34 @@ module kws_engine
   logic signed [7:0]  s3_w    [LANES];
   logic signed [16:0] s4_prod [LANES];
   logic signed [31:0] acc     [LANES];
-  logic signed [31:0] s5_sum  [LANES];  // accumulator + rounding constant
+  logic signed [31:0] s5_sum  [LANES];  // accumulator, rounding constant included
   logic [7:0]         s6_y    [LANES];
-
-  logic signed [31:0] bias    [LANES];
-  logic [3:0]         shift   [LANES];
   logic signed [31:0] acc_next[LANES];
 
   always_comb begin
-    for (int i = 0; i < LANES; i++) begin
-      bias[i]     = $signed(bias_rdata[32*i +: 32]);
-      shift[i]    = shift_rdata[4*i +: 4];
-      acc_next[i] = (s4_first ? bias[i] : acc[i]) + 32'(s4_prod[i]);
-    end
+    for (int i = 0; i < LANES; i++)
+      acc_next[i] = (s4_first ? bias_rnd[i] : acc[i]) + 32'(s4_prod[i]);
   end
 
   always_ff @(posedge clk) begin
-    // S0 -> S1
-    s1_valid   <= state == S_RUN;
-    s1_first   <= tap == 0;
-    s1_last    <= tap == last_tap;
-    s1_pad     <= pad;
-    s1_lane    <= tap[3:0];
-    s1_addr    <= ACT_AW'(out_addr);
-    feat_raddr <= FEAT_AW'(feat_addr);
-    act_raddr  <= ACT_AW'(act_addr);
-    wrom_raddr <= WROM_AW'(w_addr);
+    // S0 -> C: register coordinates
+    c_valid  <= state == S_RUN;
+    c_first  <= tap == 0;
+    c_last   <= tap == last_tap;
+    c_pad    <= pad;
+    c_lane   <= tap[3:0];
+    c_ih     <= ih;
+    c_iw     <= iw;
+    c_in_grp <= in_grp;
+    c_tap    <= tap;
+    c_addr   <= ACT_AW'(pix * GROUPS + grp);
+
+    // C -> S1: memory addresses
+    {s1_valid, s1_first, s1_last, s1_pad, s1_lane, s1_addr} <=
+        {c_valid, c_first, c_last, c_pad, c_lane, c_addr};
+    feat_raddr <= FEAT_AW'(c_ih * IN_W + c_iw);
+    act_raddr  <= ACT_AW'((c_ih * OUT_W + c_iw) * GROUPS + c_in_grp);
+    wrom_raddr <= w_base + WROM_AW'(c_tap);
 
     // S1 -> S2 (memories register their outputs)
     {s2_valid, s2_first, s2_last, s2_pad, s2_lane, s2_addr} <=
@@ -224,12 +249,12 @@ module kws_engine
     {s4_valid, s4_first, s4_last, s4_addr} <= {s3_valid, s3_first, s3_last, s3_addr};
     for (int i = 0; i < LANES; i++) s4_prod[i] <= s3_a[i] * s3_w[i];
 
-    // S4 -> S5: accumulate; on the last tap hand the sum (+ rounding constant) to requant
+    // S4 -> S5: accumulate; on the last tap hand the sum to requant
     s5_valid <= s4_valid && s4_last;
     s5_addr  <= s4_addr;
     for (int i = 0; i < LANES; i++) begin
       if (s4_valid) acc[i] <= acc_next[i];
-      s5_sum[i] <= acc_next[i] + (32'sd1 <<< (shift[i] - 4'd1));
+      s5_sum[i] <= acc_next[i];
     end
 
     // S5 -> S6: shift, ReLU, saturate to uint8
@@ -241,7 +266,7 @@ module kws_engine
       s6_y[i] <= y < 0 ? 8'd0 : y > 255 ? 8'd255 : y[7:0];
     end
 
-    if (rst) {s1_valid, s2_valid, s3_valid, s4_valid, s5_valid, s6_valid} <= '0;
+    if (rst) {c_valid, s1_valid, s2_valid, s3_valid, s4_valid, s5_valid, s6_valid} <= '0;
   end
 
   // S6: write the output word
@@ -252,19 +277,24 @@ module kws_engine
   assign act_a_we  = s6_valid && !layer[0];
   assign act_b_we  = s6_valid &&  layer[0];
 
+  wire conv_pipe_empty = !(c_valid || s1_valid || s2_valid || s3_valid || s4_valid || s5_valid || s6_valid);
+
   // Global average pool, as a plain sum of the last layer's outputs (max 500 * 255 < 2^17).
-  logic [16:0] pooled [GROUPS][LANES];
+  // Each lane sums its channel for the current group; the sums are stored per group once
+  // the group has drained, which keeps the group select out of the adder path.
+  logic [16:0] pool_acc [LANES];
+  logic [16:0] pooled   [GROUPS][LANES];
 
   always_ff @(posedge clk) begin
-    if (state == S_IDLE && start) begin
-      for (int g = 0; g < GROUPS; g++)
-        for (int i = 0; i < LANES; i++) pooled[g][i] <= '0;
-    end else if (s6_valid && layer == LAST) begin
-      for (int i = 0; i < LANES; i++) pooled[grp][i] <= pooled[grp][i] + 17'(s6_y[i]);
+    if (state == S_SETUP) begin
+      for (int i = 0; i < LANES; i++) pool_acc[i] <= '0;
+    end else if (s6_valid) begin
+      for (int i = 0; i < LANES; i++) pool_acc[i] <= pool_acc[i] + 17'(s6_y[i]);
+    end
+    if (state == S_DRAIN && conv_pipe_empty && layer == LAST) begin
+      for (int i = 0; i < LANES; i++) pooled[grp][i] <= pool_acc[i];
     end
   end
-
-  wire conv_pipe_empty = !(s1_valid || s2_valid || s3_valid || s4_valid || s5_valid || s6_valid);
 
   // ---------------------------------------------------------------------------------------
   // FC: logits[k] = fc_b[k] + sum_c fc_w[k][c] * pooled[c], then argmax.
@@ -272,6 +302,7 @@ module kws_engine
   // ---------------------------------------------------------------------------------------
   logic [3:0]         fk;
   logic [5:0]         fc;
+  logic [FCW_AW-1:0]  fcw_addr;  // fk * CHANNELS + fc
   logic               f1_valid, f1_first, f1_last;
   logic [3:0]         f1_k;
   logic [16:0]        f1_pool;
@@ -281,7 +312,7 @@ module kws_engine
   logic signed [25:0] f2_prod;
   logic signed [31:0] facc, facc_next, best;
 
-  assign fcw_raddr = FCW_AW'(fk * CHANNELS + fc);
+  assign fcw_raddr = fcw_addr;
   assign fcb_raddr = fk;
   assign facc_next = (f2_first ? f2_bias : facc) + 32'(f2_prod);
 
@@ -321,11 +352,14 @@ module kws_engine
 
     unique case (state)
       S_IDLE: if (start) begin
-        {layer, grp, oh, ow, tap, kh, kw} <= '0;
-        state <= S_SETUP;
+        {layer, grp, oh, ow, pix, tap, kh, kw} <= '0;
+        w_base  <= '0;
+        bs_addr <= '0;
+        state   <= S_SETUP;
       end
 
-      S_SETUP: state <= S_RUN;  // bias/shift ROM outputs update for the new (layer, group)
+      S_SETUP:  state <= S_SETUP2;  // bias/shift ROMs read the new (layer, group)
+      S_SETUP2: state <= S_RUN;     // latch bias/shift
 
       S_RUN: begin
         if (tap == last_tap) begin
@@ -334,9 +368,16 @@ module kws_engine
             ow <= '0;
             if (oh == 5'(OUT_H - 1)) begin
               oh    <= '0;
+              pix   <= '0;
               state <= S_DRAIN;
-            end else oh <= oh + 1'b1;
-          end else ow <= ow + 1'b1;
+            end else begin
+              oh  <= oh + 1'b1;
+              pix <= pix + 1'b1;
+            end
+          end else begin
+            ow  <= ow + 1'b1;
+            pix <= pix + 1'b1;
+          end
         end else begin
           tap <= tap + 1'b1;
           if (kw == last_kw) begin
@@ -347,12 +388,14 @@ module kws_engine
       end
 
       S_DRAIN: if (conv_pipe_empty) begin
+        w_base  <= w_base + WROM_AW'(last_tap + 1);
+        bs_addr <= bs_addr + 1'b1;
         if (grp == 2'(GROUPS - 1)) begin
           layer_done <= 1'b1;
           grp        <= '0;
           if (layer == 4'(LAST)) begin
-            {fk, fc} <= '0;
-            state    <= S_FC;
+            {fk, fc, fcw_addr} <= '0;
+            state              <= S_FC;
           end else begin
             layer <= layer + 1'b1;
             state <= S_SETUP;
@@ -364,6 +407,7 @@ module kws_engine
       end
 
       S_FC: begin
+        fcw_addr <= fcw_addr + 1'b1;
         if (fc == 6'(CHANNELS - 1)) begin
           fc <= '0;
           if (fk == 4'(N_CLASSES - 1)) state <= S_FC_DRAIN;

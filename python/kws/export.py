@@ -13,6 +13,9 @@ Memory layouts (P = LANES channels per word, lane i in bits [8i+7:8i]):
   dw weights   word g*9  + (kh*3 + kw)  lane i = w[16g+i, 0, kh, kw]
   pw weights   word g*64 + ci           lane i = w[16g+i, ci]
   bias/shift   word layer*G + g         lane i = value for channel 16g+i
+
+bias.hex holds bias + 2^(shift-1): the round-half-up constant of the requantization
+is pre-added, so the hardware requantizes with a plain arithmetic right shift.
 """
 
 import numpy as np
@@ -113,8 +116,9 @@ def main():
     packed = [pack_weights(p) for p in params["layers"]]
     bases = np.cumsum([0] + [len(w) for w in packed[:-1]]).tolist()
     write_hex("weights.hex", to_hex_words(np.concatenate(packed), 8))
-    write_hex("bias.hex", to_hex_words(
-        np.concatenate([p["b"].numpy().reshape(GROUPS, LANES) for p in params["layers"]]), 32))
+    write_hex("bias.hex", to_hex_words(np.concatenate([
+        (p["b"].long() + (1 << (p["shift"].long() - 1))).numpy().reshape(GROUPS, LANES)
+        for p in params["layers"]]), 32))
     write_hex("shift.hex", to_hex_words(
         np.concatenate([p["shift"].numpy().reshape(GROUPS, LANES) for p in params["layers"]]), 4))
     write_hex("fc_w.hex", to_hex_words(params["fc_w"].numpy().reshape(-1, 1), 8))

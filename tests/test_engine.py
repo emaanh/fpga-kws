@@ -83,7 +83,7 @@ async def test_clips(dut):
         if n < N_LAYER_CHECK_CLIPS:
             for layer, expected in enumerate(words_ref):
                 await RisingEdge(dut.layer_done)
-                mem = dut.u_act_a.mem if layer % 2 == 0 else dut.u_act_b.mem
+                mem = (dut.u_act_a if layer % 2 == 0 else dut.u_act_b).g_auto.mem
                 got = read_buffer(mem, len(expected))
                 bad = [i for i, (g, e) in enumerate(zip(got, expected)) if g != e]
                 assert not bad, (f"clip {idx} layer {layer}: {len(bad)} words differ, first at "
@@ -112,6 +112,7 @@ def test_engine():
         sources=[ROOT / "rtl/gen/kws_pkg.sv", ROOT / "rtl/sdp_ram.sv", ROOT / "rtl/kws_engine.sv"],
         hdl_toplevel="kws_engine",
         build_dir=ROOT / "build" / "sim_engine",
+        always=True,
         build_args=["--public-flat-rw", "-Wno-fatal", "-Wno-WIDTHEXPAND", "-Wno-UNUSEDSIGNAL",
                     f'-DKWS_MEM_DIR="{ROOT}/rtl/gen/"'],
     )
