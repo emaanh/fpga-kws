@@ -83,8 +83,9 @@ class Split:
     """One split held in memory. Each epoch uses every keyword clip plus a
     `extra_frac`-sized share of unknown and of silence clips (as in the TF recipe)."""
 
-    def __init__(self, name: str, device, extra_frac=0.1, seed=0):
+    def __init__(self, name: str, device, extra_frac=0.1, seed=0, gain_db=0.0):
         build_cache()
+        self.gain_db = gain_db
         d = np.load(CACHE_DIR / f"{name}.npz")
         self.audio = torch.from_numpy(d["audio"])
         self.labels = torch.from_numpy(d["labels"])
@@ -142,6 +143,11 @@ class Split:
         padded = torch.nn.functional.pad(x, (1600, 1600))
         pos = torch.arange(CLIP_SAMPLES, device=self.device)[None, :] + 1600 - shift[:, None]
         x = padded.gather(1, pos)
+
+        # Random speech level, +-10 dB: the board mic's level depends on the speaker's distance.
+        if self.gain_db:
+            db = (torch.rand(len(idx), 1, generator=self.gen) * 2 - 1) * self.gain_db
+            x = x * (10 ** (db / 20)).to(self.device)
 
         # Background noise on 80% of clips at volume up to 0.1; silence clips get up to 1.0.
         n = len(idx)

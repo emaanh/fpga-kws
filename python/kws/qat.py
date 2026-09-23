@@ -23,6 +23,7 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--epochs", type=int, default=20)
     p.add_argument("--batch-size", type=int, default=256)
+    p.add_argument("--gain-db", type=float, default=10.0, help="random speech gain range (+-dB)")
     p.add_argument("--lr", type=float, default=5e-4)
     p.add_argument("--float-ckpt", default="dscnn_float.pt")
     p.add_argument("--out", default="dscnn_int8.pt")
@@ -30,7 +31,8 @@ def main():
 
     device = pick_device()
     torch.manual_seed(0)
-    train, val, test = (Split(s, device) for s in ["train", "val", "test"])
+    train = Split("train", device, gain_db=args.gain_db)
+    val, test = Split("val", device), Split("test", device)
 
     ckpt = torch.load(CKPT_DIR / args.float_ckpt)
     model, frontend = DSCNN(), LogMel()
@@ -67,9 +69,9 @@ def main():
         print(f"qat epoch {epoch + 1:3d}  loss {total_loss / n:.4f}  val {acc:.4f}  {time.time() - t0:.0f}s")
         if acc > best:
             best = acc
-            torch.save(qm.state_dict(), CKPT_DIR / "dscnn_qat.pt")
+            torch.save(qm.state_dict(), CKPT_DIR / args.out.replace("int8", "qat"))
 
-    qm.load_state_dict(torch.load(CKPT_DIR / "dscnn_qat.pt"))
+    qm.load_state_dict(torch.load(CKPT_DIR / args.out.replace("int8", "qat")))
     params = qm.to_int()
     torch.save(params, CKPT_DIR / args.out)
     print("\n" + describe(params))

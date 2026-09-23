@@ -19,4 +19,19 @@ package kws_pkg;
   localparam int          LAYER_WBASE[N_LAYERS] = '{0, 160, 196, 452, 488, 744, 780, 1036, 1072};
 
   // For reference only (e.g. testbench printouts): "silence", "unknown", "yes", "no", "up", "down", "left", "right", "on", "off", "stop", "go"
+
+  // Mic path (python/kws/mic_model.py)
+  localparam int CIC_R       = 25;
+  localparam int CIC_N       = 4;
+  localparam int FIR_D       = 5;
+  localparam int FIR_TAPS    = 191;
+  localparam int MAX_GAIN    = 12;
+
+  // Audio frontend (python/kws/fixed_frontend.py)
+  localparam int FFT_N       = 512;
+  localparam int HOP         = 320;
+  localparam int N_MELS      = IN_W;
+  localparam int MEL_ENTRIES = 466;
+  localparam longint FE_EPS  = 274878;
+  localparam int FE_OFFSET   = 1888;  // Q6, model-specific
 endpackage

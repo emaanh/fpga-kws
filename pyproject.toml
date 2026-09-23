@@ -3,6 +3,7 @@ name = "kws"
 version = "0.1.0"
 requires-python = ">=3.12,<3.13"
 dependencies = [
+    "numba>=0.67.0",
     "numpy",
     "pyserial>=3.5",
     "scipy",

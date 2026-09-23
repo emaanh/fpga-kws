@@ -4,7 +4,8 @@
 
 Writes:
   rtl/gen/kws_pkg.sv     constants (layer table, ROM bases, widths) shared with the RTL
-  rtl/gen/*.hex          ROM contents for $readmemh
+  rtl/gen/*.hex          ROM contents for $readmemh (fe_*.hex: mic path and audio frontend,
+                         see mic_model.py and fixed_frontend.py)
   build/vectors/         golden inputs/outputs for a few test clips, plus the full test set
 
 Memory layouts (P = LANES channels per word, lane i in bits [8i+7:8i]):
@@ -24,6 +25,8 @@ import torch
 from .config import CKPT_DIR, CLASSES, ROOT
 from .data import Split
 from .features import LogMel
+from .fixed_frontend import EPS, HANN_Q15, LOG2_LUT, MEL_Q8, TW_IM, TW_RE, offset_q6
+from .mic_model import CIC_N, CIC_R, FIR_D, FIR_Q17, MAX_GAIN
 from .quant import int_forward, quantize_input
 
 LANES = 16
@@ -75,7 +78,23 @@ def layer_kind(p):
     return "DW" if p["groups"] > 1 else "PW"
 
 
-def write_package(params, bases):
+def write_frontend_roms():
+    """Mic path + frontend ROMs. Returns the number of mel ROM entries."""
+    write_hex("fe_fir.hex", to_hex_words(FIR_Q17.reshape(-1, 1), 18))
+    write_hex("fe_hann.hex", to_hex_words(HANN_Q15.reshape(-1, 1), 16))
+    write_hex("fe_twiddle.hex", to_hex_words(np.stack([TW_RE, TW_IM], 1), 18))
+    write_hex("fe_log2.hex", to_hex_words(LOG2_LUT.reshape(-1, 1), 7))
+    # Mel entries in band order: {last_in_band, weight(9), bin(9)}.
+    entries = []
+    for m in range(MEL_Q8.shape[1]):
+        nz = np.nonzero(MEL_Q8[:, m])[0]
+        for j, k in enumerate(nz):
+            entries.append((int(j == len(nz) - 1) << 18) | (int(MEL_Q8[k, m]) << 9) | int(k))
+    write_hex("fe_mel.hex", to_hex_words(np.array(entries).reshape(-1, 1), 19))
+    return len(entries)
+
+
+def write_package(params, bases, n_mel_entries):
     kinds = [layer_kind(p) for p in params["layers"]]
     shifts = torch.cat([p["shift"] for p in params["layers"]])
     assert 1 <= int(shifts.min()) and int(shifts.max()) < 16, "shift must fit in 4 bits"
@@ -105,6 +124,21 @@ package kws_pkg;
   localparam int          LAYER_WBASE[N_LAYERS] = '{{{base_list}}};
 
   // For reference only (e.g. testbench printouts): {classes}
+
+  // Mic path (python/kws/mic_model.py)
+  localparam int CIC_R       = {CIC_R};
+  localparam int CIC_N       = {CIC_N};
+  localparam int FIR_D       = {FIR_D};
+  localparam int FIR_TAPS    = {len(FIR_Q17)};
+  localparam int MAX_GAIN    = {MAX_GAIN};
+
+  // Audio frontend (python/kws/fixed_frontend.py)
+  localparam int FFT_N       = 512;
+  localparam int HOP         = 320;
+  localparam int N_MELS      = IN_W;
+  localparam int MEL_ENTRIES = {n_mel_entries};
+  localparam longint FE_EPS  = {EPS};
+  localparam int FE_OFFSET   = {offset_q6(params["mean"], params["f_in"])};  // Q6, model-specific
 endpackage
 """)
 
@@ -123,7 +157,7 @@ def main():
         np.concatenate([p["shift"].numpy().reshape(GROUPS, LANES) for p in params["layers"]]), 4))
     write_hex("fc_w.hex", to_hex_words(params["fc_w"].numpy().reshape(-1, 1), 8))
     write_hex("fc_b.hex", to_hex_words(params["fc_b"].numpy().reshape(-1, 1), 32))
-    write_package(params, bases)
+    write_package(params, bases, write_frontend_roms())
 
     # Test-set features, computed on CPU so they are reproducible.
     frontend = LogMel()

@@ -22,6 +22,11 @@ SOURCES=(
   "$ROOT/rtl/uart_rx.sv"
   "$ROOT/rtl/uart_tx.sv"
   "$ROOT/rtl/seg7_word.sv"
+  "$ROOT/rtl/pdm_mic.sv"
+  "$ROOT/rtl/cic_decim.sv"
+  "$ROOT/rtl/mic_fir.sv"
+  "$ROOT/rtl/audio_frontend.sv"
+  "$ROOT/rtl/kws_live.sv"
   "$ROOT/rtl/kws_top.sv"
 )
 
@@ -37,15 +42,32 @@ yosys -q -l "$OUT/yosys.log" -p "
   write_json $OUT/kws_top.json
 "
 
-step "nextpnr-xilinx (log: build/bit/nextpnr.log)"
-"$OPENXC7/nextpnr-xilinx/build/nextpnr-xilinx" \
-  --chipdb "$OPENXC7/chipdb/xc7a100t.bin" \
-  --xdc "$ROOT/constraints/nexys_a7_100t.xdc" \
-  --json "$OUT/kws_top.json" \
-  --fasm "$OUT/kws_top.fasm" \
-  --report "$OUT/report.json" \
-  --freq 100 \
-  --log "$OUT/nextpnr.log" -q
+# Placement quality varies with the seed; try several in parallel and keep the fastest.
+SEEDS="${SEEDS:-1 2 3 4 5 6 7 8}"
+step "nextpnr-xilinx, seeds: $SEEDS (logs: build/bit/seed*/nextpnr.log)"
+for seed in $SEEDS; do
+  mkdir -p "$OUT/seed$seed"
+  "$OPENXC7/nextpnr-xilinx/build/nextpnr-xilinx" \
+    --chipdb "$OPENXC7/chipdb/xc7a100t.bin" \
+    --xdc "$ROOT/constraints/nexys_a7_100t.xdc" \
+    --json "$OUT/kws_top.json" \
+    --fasm "$OUT/seed$seed/kws_top.fasm" \
+    --report "$OUT/seed$seed/report.json" \
+    --freq 100 --seed "$seed" \
+    --log "$OUT/seed$seed/nextpnr.log" -q > /dev/null 2>&1 &
+done
+wait
+best=""; best_mhz=0
+for seed in $SEEDS; do
+  mhz=$(grep "Max frequency for clock" "$OUT/seed$seed/nextpnr.log" | tail -1 | sed -E 's/.*: ([0-9.]+) MHz.*/\1/')
+  echo "    seed $seed: ${mhz:-failed} MHz"
+  if [[ -n "$mhz" ]] && awk "BEGIN{exit !($mhz > $best_mhz)}"; then best=$seed; best_mhz=$mhz; fi
+done
+[[ -n "$best" ]] || { echo "nextpnr failed for every seed"; exit 1; }
+cp "$OUT/seed$best/kws_top.fasm" "$OUT/kws_top.fasm"
+cp "$OUT/seed$best/nextpnr.log" "$OUT/nextpnr.log"
+cp "$OUT/seed$best/report.json" "$OUT/report.json"
+echo "    using seed $best: $best_mhz MHz $(awk "BEGIN{print ($best_mhz >= 100 ? \"(meets 100 MHz)\" : \"(DOES NOT MEET 100 MHz)\")}")"
 
 step "fasm2frames"
 "$OPENXC7/venv/bin/python" "$OPENXC7/prjxray/utils/fasm2frames.py" \
@@ -56,8 +78,7 @@ step "xc7frames2bit"
   --part_file "$DB/$PART/part.yaml" --part_name "$PART" \
   --frm_file "$OUT/kws_top.frames" --output_file "$OUT/kws_top.bit"
 
-grep -E "Max frequency for clock" "$OUT/nextpnr.log" | tail -1 || true
-echo "Bitstream: build/bit/kws_top.bit"
+echo "Bitstream: build/bit/kws_top.bit (seed $best, $best_mhz MHz)"
 
 if [[ "${1:-}" == "program" ]]; then
   step "openFPGALoader"

@@ -54,17 +54,24 @@ module seg7_word (
   endfunction
 
   // Scan one digit every 2^14 cycles (~6 kHz at 100 MHz, ~760 Hz per digit).
+  // Registered step by step (word, character, glyph): the display has time, the clock doesn't.
   logic [16:0] scan;
-  logic [2:0]  digit;
+  logic [2:0]  digit, digit_q;
   logic [63:0] text;
+  logic [7:0]  ch;
+  logic        show_q, show_qq;
 
   assign digit = scan[16:14];
-  assign text  = word(class_idx);
 
   always_ff @(posedge clk) begin
-    scan <= scan + 1'b1;
-    an   <= ~(8'd1 << digit);
-    seg  <= show ? ~glyph(text[8*digit +: 8]) : 7'h7F;
+    scan    <= scan + 1'b1;
+    text    <= word(class_idx);
+    show_q  <= show;
+    ch      <= text[8*digit +: 8];
+    digit_q <= digit;
+    show_qq <= show_q;
+    an      <= ~(8'd1 << digit_q);
+    seg     <= show_qq ? ~glyph(ch) : 7'h7F;
   end
 
   assign dp = 1'b1;

@@ -14,6 +14,11 @@ from cocotb.triggers import ClockCycles, FallingEdge, Timer, with_timeout
 
 from test_engine import ROOT, load_reference
 
+TOP_SOURCES = [ROOT / f for f in [
+    "rtl/gen/kws_pkg.sv", "rtl/sdp_ram.sv", "rtl/kws_engine.sv", "rtl/uart_rx.sv",
+    "rtl/uart_tx.sv", "rtl/seg7_word.sv", "rtl/pdm_mic.sv", "rtl/cic_decim.sv", "rtl/mic_fir.sv",
+    "rtl/audio_frontend.sv", "rtl/kws_live.sv", "rtl/kws_top.sv"]]
+
 CLK_NS = 10
 CLKS_PER_BIT = 8
 BIT_NS = CLK_NS * CLKS_PER_BIT
@@ -47,6 +52,8 @@ async def test_uart_inference(dut):
     feats, labels, reference = load_reference()
     Clock(dut.clk, CLK_NS, unit="ns").start()
     dut.uart_rx.value = 1
+    dut.sw.value = 0  # UART feature mode
+    dut.m_data.value = 0
     dut.rst_n.value = 0
     await ClockCycles(dut.clk, 5)
     dut.rst_n.value = 1
@@ -80,9 +87,7 @@ def test_top():
     runner = get_runner("verilator")
     build_dir = ROOT / "build" / "sim_top"
     runner.build(
-        sources=[ROOT / f for f in ["rtl/gen/kws_pkg.sv", "rtl/sdp_ram.sv", "rtl/kws_engine.sv",
-                                    "rtl/uart_rx.sv", "rtl/uart_tx.sv", "rtl/seg7_word.sv",
-                                    "rtl/kws_top.sv"]],
+        sources=TOP_SOURCES,
         hdl_toplevel="kws_top",
         build_dir=build_dir,
         always=True,

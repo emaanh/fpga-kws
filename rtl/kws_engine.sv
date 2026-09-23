@@ -12,7 +12,7 @@
 // The pipeline drains between groups so bias/shift can change safely.
 //
 // Pipeline:  S0 issue -> C coordinates -> S1 mem addr -> S2 mem data, operand select
-//            -> S3 multiply -> S4 accumulate -> S5 shift, clamp -> S6 write (+ pool on last layer)
+//            -> S3 multiply -> S4 accumulate -> S5 shift -> S5b clamp -> S6 write (+ pool)
 
 `ifndef KWS_MEM_DIR
 `define KWS_MEM_DIR ""
@@ -33,6 +33,7 @@ module kws_engine
   output logic               busy,
   output logic               done,        // one-cycle pulse; outputs below are then valid
   output logic [3:0]         class_idx,
+  output logic signed [31:0] margin,      // top logit minus the runner-up
   output logic signed [31:0] logits [N_CLASSES]
 );
   localparam int ACT_AW  = $clog2(ACT_WORDS);
@@ -79,10 +80,9 @@ module kws_engine
   end
 
   // ---------------------------------------------------------------------------------------
-  // S0: input coordinates and padding for the current tap (addresses are formed in S1)
+  // S0: input coordinates for the current tap (padding and addresses are formed in S1)
   // ---------------------------------------------------------------------------------------
   logic signed [7:0] oh_s, ow_s, kh_s, kw_s, ih, iw;
-  logic              pad;
   logic [1:0]        in_grp;
 
   assign oh_s = 8'(oh);
@@ -93,19 +93,16 @@ module kws_engine
   always_comb begin
     unique case (kind)
       L_STEM: begin  // 10x4 kernel, stride 2, padding (5, 1)
-        ih  = 2 * oh_s + kh_s - 8'sd5;
-        iw  = 2 * ow_s + kw_s - 8'sd1;
-        pad = ih < 0 || ih >= IN_H || iw < 0 || iw >= IN_W;
+        ih = 2 * oh_s + kh_s - 8'sd5;
+        iw = 2 * ow_s + kw_s - 8'sd1;
       end
       L_DW: begin    // 3x3 kernel, stride 1, padding 1
-        ih  = oh_s + kh_s - 8'sd1;
-        iw  = ow_s + kw_s - 8'sd1;
-        pad = ih < 0 || ih >= OUT_H || iw < 0 || iw >= OUT_W;
+        ih = oh_s + kh_s - 8'sd1;
+        iw = ow_s + kw_s - 8'sd1;
       end
       default: begin
-        ih  = oh_s;
-        iw  = ow_s;
-        pad = 1'b0;
+        ih = oh_s;
+        iw = ow_s;
       end
     endcase
     in_grp = kind == L_PW ? tap[5:4] : grp;
@@ -144,10 +141,10 @@ module kws_engine
   sdp_ram #(.WIDTH(8 * LANES), .DEPTH(WROM_WORDS), .INIT({MEM_DIR, "weights.hex"})) u_wrom (
     .clk, .we(1'b0), .waddr('0), .wdata('0), .raddr(wrom_raddr), .rdata(wrom_rdata));
   // Bias and shift ROMs: one word per (layer, group), read during S_SETUP.
-  sdp_ram #(.WIDTH(32 * LANES), .DEPTH(N_LAYERS * GROUPS), .INIT({MEM_DIR, "bias.hex"})) u_bias (
+  sdp_ram #(.WIDTH(32 * LANES), .DEPTH(N_LAYERS * GROUPS), .INIT({MEM_DIR, "bias.hex"}), .STYLE("block")) u_bias (
     .clk, .we(1'b0), .waddr('0), .wdata('0),
     .raddr(bs_addr), .rdata(bias_rdata));
-  sdp_ram #(.WIDTH(4 * LANES), .DEPTH(N_LAYERS * GROUPS), .INIT({MEM_DIR, "shift.hex"})) u_shift (
+  sdp_ram #(.WIDTH(4 * LANES), .DEPTH(N_LAYERS * GROUPS), .INIT({MEM_DIR, "shift.hex"}), .STYLE("block")) u_shift (
     .clk, .we(1'b0), .waddr('0), .wdata('0),
     .raddr(bs_addr), .rdata(shift_rdata));
   sdp_ram #(.WIDTH(8), .DEPTH(N_CLASSES * CHANNELS), .INIT({MEM_DIR, "fc_w.hex"}), .STYLE("block")) u_fcw (
@@ -174,7 +171,8 @@ module kws_engine
   // ---------------------------------------------------------------------------------------
   // Conv pipeline
   // ---------------------------------------------------------------------------------------
-  logic              c_valid, c_first, c_last, c_pad;
+  logic              c_valid, c_first, c_last;
+  logic signed [7:0] c_h_lim, c_w_lim;  // input height/width for the padding check
   logic [3:0]        c_lane;
   logic signed [7:0] c_ih, c_iw;
   logic [1:0]        c_in_grp;
@@ -190,8 +188,8 @@ module kws_engine
   logic [ACT_AW-1:0] s3_addr;
   logic              s4_valid, s4_first, s4_last;
   logic [ACT_AW-1:0] s4_addr;
-  logic              s5_valid;
-  logic [ACT_AW-1:0] s5_addr;
+  logic              s5_valid, s5b_valid;
+  logic [ACT_AW-1:0] s5_addr, s5b_addr;
   logic              s6_valid;
   logic [ACT_AW-1:0] s6_addr;
 
@@ -200,6 +198,7 @@ module kws_engine
   logic signed [16:0] s4_prod [LANES];
   logic signed [31:0] acc     [LANES];
   logic signed [31:0] s5_sum  [LANES];  // accumulator, rounding constant included
+  logic signed [31:0] s5b_y   [LANES];  // after the shift
   logic [7:0]         s6_y    [LANES];
   logic signed [31:0] acc_next[LANES];
 
@@ -213,7 +212,8 @@ module kws_engine
     c_valid  <= state == S_RUN;
     c_first  <= tap == 0;
     c_last   <= tap == last_tap;
-    c_pad    <= pad;
+    c_h_lim  <= kind == L_STEM ? 8'(IN_H) : 8'(OUT_H);
+    c_w_lim  <= kind == L_STEM ? 8'(IN_W) : 8'(OUT_W);
     c_lane   <= tap[3:0];
     c_ih     <= ih;
     c_iw     <= iw;
@@ -221,9 +221,9 @@ module kws_engine
     c_tap    <= tap;
     c_addr   <= ACT_AW'(pix * GROUPS + grp);
 
-    // C -> S1: memory addresses
-    {s1_valid, s1_first, s1_last, s1_pad, s1_lane, s1_addr} <=
-        {c_valid, c_first, c_last, c_pad, c_lane, c_addr};
+    // C -> S1: padding and memory addresses (PW coordinates are always in range)
+    {s1_valid, s1_first, s1_last, s1_lane, s1_addr} <= {c_valid, c_first, c_last, c_lane, c_addr};
+    s1_pad <= c_ih < 0 || c_ih >= c_h_lim || c_iw < 0 || c_iw >= c_w_lim;
     feat_raddr <= FEAT_AW'(c_ih * IN_W + c_iw);
     act_raddr  <= ACT_AW'((c_ih * OUT_W + c_iw) * GROUPS + c_in_grp);
     wrom_raddr <= w_base + WROM_AW'(c_tap);
@@ -257,16 +257,18 @@ module kws_engine
       s5_sum[i] <= acc_next[i];
     end
 
-    // S5 -> S6: shift, ReLU, saturate to uint8
-    s6_valid <= s5_valid;
-    s6_addr  <= s5_addr;
-    for (int i = 0; i < LANES; i++) begin
-      logic signed [31:0] y;
-      y = s5_sum[i] >>> shift[i];
-      s6_y[i] <= y < 0 ? 8'd0 : y > 255 ? 8'd255 : y[7:0];
-    end
+    // S5 -> S5b: shift
+    s5b_valid <= s5_valid;
+    s5b_addr  <= s5_addr;
+    for (int i = 0; i < LANES; i++) s5b_y[i] <= s5_sum[i] >>> shift[i];
 
-    if (rst) {c_valid, s1_valid, s2_valid, s3_valid, s4_valid, s5_valid, s6_valid} <= '0;
+    // S5b -> S6: ReLU, saturate to uint8
+    s6_valid <= s5b_valid;
+    s6_addr  <= s5b_addr;
+    for (int i = 0; i < LANES; i++)
+      s6_y[i] <= s5b_y[i] < 0 ? 8'd0 : s5b_y[i] > 255 ? 8'd255 : s5b_y[i][7:0];
+
+    if (rst) {c_valid, s1_valid, s2_valid, s3_valid, s4_valid, s5_valid, s5b_valid, s6_valid} <= '0;
   end
 
   // S6: write the output word
@@ -277,13 +279,15 @@ module kws_engine
   assign act_a_we  = s6_valid && !layer[0];
   assign act_b_we  = s6_valid &&  layer[0];
 
-  wire conv_pipe_empty = !(c_valid || s1_valid || s2_valid || s3_valid || s4_valid || s5_valid || s6_valid);
+  wire conv_pipe_empty = !(c_valid || s1_valid || s2_valid || s3_valid || s4_valid || s5_valid ||
+                             s5b_valid || s6_valid);
 
   // Global average pool, as a plain sum of the last layer's outputs (max 500 * 255 < 2^17).
   // Each lane sums its channel for the current group; the sums are stored per group once
   // the group has drained, which keeps the group select out of the adder path.
   logic [16:0] pool_acc [LANES];
   logic [16:0] pooled   [GROUPS][LANES];
+  logic [GROUPS-1:0] pool_we;
 
   always_ff @(posedge clk) begin
     if (state == S_SETUP) begin
@@ -291,57 +295,80 @@ module kws_engine
     end else if (s6_valid) begin
       for (int i = 0; i < LANES; i++) pool_acc[i] <= pool_acc[i] + 17'(s6_y[i]);
     end
-    if (state == S_DRAIN && conv_pipe_empty && layer == LAST) begin
-      for (int i = 0; i < LANES; i++) pooled[grp][i] <= pool_acc[i];
-    end
+    // Store one cycle after the group drains (a registered, one-hot enable: it fans out to
+    // every pooled register). pool_acc is only cleared in the S_SETUP that follows.
+    for (int g = 0; g < GROUPS; g++)
+      pool_we[g] <= state == S_DRAIN && conv_pipe_empty && layer == LAST && grp == 2'(g);
+    for (int g = 0; g < GROUPS; g++)
+      if (pool_we[g]) for (int i = 0; i < LANES; i++) pooled[g][i] <= pool_acc[i];
   end
 
   // ---------------------------------------------------------------------------------------
   // FC: logits[k] = fc_b[k] + sum_c fc_w[k][c] * pooled[c], then argmax.
-  // F0 issue -> F1 ROM data, multiply -> F2 accumulate
+  // F0 issue -> F1 ROM data, pick the group of 16 pooled sums -> F2 pick the lane
+  // -> F3 multiply -> F4 accumulate. (The 64:1 pooled mux in one cycle was too slow.)
   // ---------------------------------------------------------------------------------------
   logic [3:0]         fk;
   logic [5:0]         fc;
   logic [FCW_AW-1:0]  fcw_addr;  // fk * CHANNELS + fc
   logic               f1_valid, f1_first, f1_last;
-  logic [3:0]         f1_k;
-  logic [16:0]        f1_pool;
+  logic [3:0]         f1_k, f1_lane;
+  logic [16:0]        f1_group [LANES];
   logic               f2_valid, f2_first, f2_last;
   logic [3:0]         f2_k;
+  logic [16:0]        f2_pool;
+  logic signed [7:0]  f2_w;
   logic signed [31:0] f2_bias;
-  logic signed [25:0] f2_prod;
-  logic signed [31:0] facc, facc_next, best;
+  logic               f3_valid, f3_first, f3_last;
+  logic [3:0]         f3_k;
+  logic signed [31:0] f3_bias;
+  logic signed [25:0] f3_prod;
+  logic signed [31:0] facc, facc_next, best, second;
 
   assign fcw_raddr = fcw_addr;
   assign fcb_raddr = fk;
-  assign facc_next = (f2_first ? f2_bias : facc) + 32'(f2_prod);
+  assign facc_next = (f3_first ? f3_bias : facc) + 32'(f3_prod);
 
   always_ff @(posedge clk) begin
     f1_valid <= state == S_FC;
     f1_first <= fc == 0;
     f1_last  <= fc == CHANNELS - 1;
     f1_k     <= fk;
-    f1_pool  <= pooled[fc[5:4]][fc[3:0]];
+    f1_lane  <= fc[3:0];
+    for (int i = 0; i < LANES; i++) f1_group[i] <= pooled[fc[5:4]][i];
 
     {f2_valid, f2_first, f2_last, f2_k} <= {f1_valid, f1_first, f1_last, f1_k};
+    f2_pool <= f1_group[f1_lane];
+    f2_w    <= $signed(fcw_rdata);
     f2_bias <= $signed(fcb_rdata);
-    f2_prod <= $signed(fcw_rdata) * $signed({1'b0, f1_pool});
 
-    if (f2_valid) begin
+    {f3_valid, f3_first, f3_last, f3_k} <= {f2_valid, f2_first, f2_last, f2_k};
+    f3_bias <= f2_bias;
+    f3_prod <= f2_w * $signed({1'b0, f2_pool});
+
+    if (f3_valid) begin
       facc <= facc_next;
-      if (f2_last) begin
-        logits[f2_k] <= facc_next;
-        if (f2_k == 0 || facc_next > best) begin  // strict > keeps the first max, like argmax
+      if (f3_last) begin
+        logits[f3_k] <= facc_next;
+        // Strict > keeps the first max, like argmax. Also track the runner-up for `margin`.
+        if (f3_k == 0) begin
           best      <= facc_next;
-          class_idx <= f2_k;
+          second    <= 32'sh8000_0000;
+          class_idx <= f3_k;
+        end else if (facc_next > best) begin
+          best      <= facc_next;
+          second    <= best;
+          class_idx <= f3_k;
+        end else if (facc_next > second) begin
+          second <= facc_next;
         end
       end
     end
 
-    if (rst) {f1_valid, f2_valid} <= '0;
+    if (rst) {f1_valid, f2_valid, f3_valid} <= '0;
   end
 
-  wire fc_pipe_empty = !(f1_valid || f2_valid);
+  wire fc_pipe_empty = !(f1_valid || f2_valid || f3_valid);
 
   // ---------------------------------------------------------------------------------------
   // Control
@@ -418,7 +445,8 @@ module kws_engine
       S_FC_DRAIN: if (fc_pipe_empty) state <= S_DONE;
 
       S_DONE: begin
-        done  <= 1'b1;
+        done   <= 1'b1;
+        margin <= best - second;
         state <= S_IDLE;
       end
 

@@ -1,9 +1,9 @@
-# Out-of-context synthesis + place & route of kws_engine for the Nexys A7-100T,
-# to check resource use and 100 MHz timing before the board wrapper exists.
+# Vivado build of the full design for the Nexys A7-100T: synthesis, place & route, timing
+# sign-off at 100 MHz and a bitstream. (The day-to-day flow is scripts/build_bitstream.sh.)
 #
 #   vivado -mode batch -source scripts/vivado_synth.tcl
 #
-# Reports go to build/vivado/. Needs the generated files in rtl/gen/ (committed).
+# Reports and build/vivado/kws_top.bit go to build/vivado/. Needs rtl/gen/ (committed).
 
 set root    [file normalize [file join [file dirname [info script]] ..]]
 set gen_dir [file join $root rtl gen]
@@ -12,18 +12,14 @@ file mkdir $out_dir
 
 set_part xc7a100tcsg324-1
 
-read_verilog -sv [list \
-  [file join $gen_dir kws_pkg.sv] \
-  [file join $root rtl sdp_ram.sv] \
-  [file join $root rtl kws_engine.sv] \
-]
+set sources {
+  gen/kws_pkg.sv sdp_ram.sv kws_engine.sv uart_rx.sv uart_tx.sv seg7_word.sv
+  pdm_mic.sv cic_decim.sv mic_fir.sv audio_frontend.sv kws_live.sv kws_top.sv
+}
+foreach f $sources { read_verilog -sv [file join $root rtl $f] }
+read_xdc [file join $root constraints nexys_a7_100t.xdc]
 
-# Out-of-context: the engine's ports are not pins, so no I/O placement is needed.
-synth_design -top kws_engine -mode out_of_context \
-  -verilog_define KWS_MEM_DIR=\"$gen_dir/\"
-
-create_clock -name clk -period 10.000 [get_ports clk]
-
+synth_design -top kws_top -verilog_define KWS_MEM_DIR=\"$gen_dir/\"
 opt_design
 place_design
 route_design
@@ -31,7 +27,8 @@ route_design
 report_utilization    -file [file join $out_dir utilization.rpt]
 report_timing_summary -file [file join $out_dir timing_summary.rpt]
 report_timing -max_paths 10 -file [file join $out_dir timing_paths.rpt]
+write_bitstream -force [file join $out_dir kws_top.bit]
 
 set wns [get_property SLACK [get_timing_paths -max_paths 1 -nworst 1 -setup]]
-puts "\n=== kws_engine @ 100 MHz: worst setup slack $wns ns ([expr {$wns >= 0 ? "MET" : "FAILED"}]) ==="
-puts "Reports in $out_dir"
+puts "\n=== kws_top @ 100 MHz: worst setup slack $wns ns ([expr {$wns >= 0 ? "MET" : "FAILED"}]) ==="
+puts "Reports and bitstream in $out_dir"
