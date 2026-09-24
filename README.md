@@ -36,16 +36,7 @@ about 100 false alarms per hour from non-keyword speech.
 Resources used on FPGA: about 10k LUTs (8%), 32 DSP48 (13%) and 20% of block RAM. One
 inference takes 665k cycles (6.65 ms at 100 MHz) and runs every 100 ms.
 
-## How it works
-
-```
-PDM mic (2 MHz, 1 bit)
-  -> CIC decimator /25 -> FIR /5 with CIC compensation -> DC blocker -> gain   16 kHz PCM
-  -> every 20 ms: Hann window, 512-point FFT, power, 40 mel bands, log2         40 int8 features
-  -> 64-frame ring buffer
-  -> every 100 ms: the last 49 frames (~1 s) -> DS-CNN engine                   12 logits
-  -> decision: a keyword that wins 3 inferences in a row by a margin             display
-```
+## how it works
 
 - **Model:** DS-CNN-S, 23k parameters: a 10x4 conv,
   four depthwise-separable blocks with 64 channels, global average pool and a 12-way FC.
@@ -57,7 +48,7 @@ PDM mic (2 MHz, 1 bit)
 - **Frontend** (`rtl/audio_frontend.sv`): a sequential radix-2 FFT and a sparse mel filter
   bank, about 18k cycles per 20 ms frame.
 
-## Getting started
+## setup
 
 Requirements: [uv](https://docs.astral.sh/uv/), and from Homebrew `verilator`, `yosys`,
 `sv2v` and `openfpgaloader`.
@@ -81,7 +72,7 @@ uv run python -m kws.eval_stream                    # tune the live decision rul
 KWS_N_CLIPS=all uv run pytest tests/test_engine.py  # engine on the whole test set (~1 h)
 ```
 
-## Building the bitstream
+## generate bitstream
 
 ```sh
 scripts/build_bitstream.sh           # build/bit/kws_top.bit
@@ -119,7 +110,7 @@ cmake -S prjxray -B prjxray/build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_PO
 cmake --build prjxray/build --target xc7frames2bit
 ```
 
-## Board controls
+## board controls
 
 | Switch | Function |
 |---|---|
