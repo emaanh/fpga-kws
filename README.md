@@ -1,7 +1,7 @@
 # Keyword Spotting on FPGA
 
 ## motivation
-A year ago I implemented inference of a 4-layer MLP on an FPGA for doing MNIST digit classification. I wanted to see what other ML models could be run this hardware. In this project, I'm doing keyword spotting. 
+A year ago I implemented inference of a 4-layer MLP on an FPGA for doing MNIST digit classification. I wanted to see what other ML models could be run this hardware. In this project, I'm doing keyword spotting. I'm now taking this a step further to design and implement language models for FPGAs in [Alloy](https://github.com/emaanh/Alloy)
 
 ## background
 Keyword spotting is a pretty well suited task for hardware since it's typically "always-on" and thus needs to be low-power, esp on edge, battery-powered devices. The most obvious example is Apple's low-power always-on processors that support features like  "Hey Siri." 
