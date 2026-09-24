@@ -1,0 +1,339 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>KWS live demo</title>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #171a21; --panel2: #1e222b; --line: #2a2f3a;
+    --text: #e6e8ec; --muted: #8b93a3; --accent: #4cc38a; --warn: #f0b44c;
+    --seg-on: #ff3b30; --seg-off: #2a1614; --led-on: #3ddc84; --led-off: #1b2a21;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  .mono { font-family: ui-monospace, "SF Mono", Menlo, monospace; }
+  header { padding: 18px 24px 8px; display: flex; align-items: baseline; gap: 16px; flex-wrap: wrap; }
+  header h1 { margin: 0; font-size: 18px; font-weight: 600; }
+  header .sub { color: var(--muted); font-size: 13px; }
+  #status { margin-left: auto; font-size: 13px; color: var(--muted); }
+  #status .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+                 background: var(--muted); margin-right: 6px; vertical-align: middle; }
+  #status.live .dot { background: var(--accent); box-shadow: 0 0 8px var(--accent); }
+  #warn { display: none; margin: 0 24px 8px; padding: 10px 14px; border-radius: 8px;
+          background: #3a2e14; color: var(--warn); border: 1px solid #5a4620; }
+  main { display: grid; grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr); gap: 16px;
+         padding: 8px 24px 24px; }
+  @media (max-width: 900px) { main { grid-template-columns: 1fr; padding: 8px 16px 16px; }
+                              header { padding: 16px 16px 8px; } #warn { margin: 0 16px 8px; } }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 16px; }
+  .panel h2 { margin: 0 0 12px; font-size: 12px; font-weight: 600; letter-spacing: .06em;
+              text-transform: uppercase; color: var(--muted); }
+  .stack { display: grid; gap: 16px; align-content: start; min-width: 0; }
+  .stack > * { min-width: 0; }
+
+  /* Board */
+  .board { background: linear-gradient(180deg, #1c2a22, #16211b); border-color: #2c3d33; }
+  .display { background: #0b0c0e; border-radius: 8px; padding: 14px 12px; display: flex;
+             justify-content: center; gap: 6px; }
+  .digit { width: 11%; max-width: 54px; }
+  .digit svg { width: 100%; display: block; }
+  .digit polygon { fill: var(--seg-off); transition: fill .05s; }
+  .digit polygon.on { fill: var(--seg-on); filter: drop-shadow(0 0 3px rgba(255,59,48,.7)); }
+  .leds { display: flex; justify-content: space-between; margin-top: 16px; gap: 4px; }
+  .led { display: grid; justify-items: center; gap: 4px; flex: 1; }
+  .led i { width: 14px; height: 14px; border-radius: 50%; background: var(--led-off);
+           border: 1px solid #0d1510; }
+  .led i.on { background: var(--led-on); box-shadow: 0 0 8px var(--led-on); }
+  .led span { font-size: 10px; color: #7f9a88; }
+  .legend { margin-top: 10px; font-size: 12px; color: #9fb3a6; }
+
+  /* Controls */
+  .controls { display: grid; gap: 14px; }
+  .ctl label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 6px; }
+  .seg { display: flex; flex-wrap: wrap; gap: 6px; }
+  .seg button { background: var(--panel2); color: var(--text); border: 1px solid var(--line);
+                border-radius: 6px; padding: 6px 10px; font: inherit; font-size: 13px; cursor: pointer; }
+  .seg button:hover { border-color: #3d4452; }
+  .seg button.on { background: #1f3a2d; border-color: var(--accent); color: #d8f5e6; }
+  .meter { position: relative; height: 12px; border-radius: 6px; background: var(--panel2); overflow: hidden; }
+  .meter .target { position: absolute; top: 0; bottom: 0; background: rgba(76,195,138,.18);
+                   border-left: 1px dashed var(--accent); border-right: 1px dashed var(--accent); }
+  .meter .fill { position: absolute; top: 0; bottom: 0; left: 0; background: var(--accent);
+                 transition: width .05s; opacity: .85; }
+  .meter-row { display: flex; justify-content: space-between; font-size: 12px; color: var(--muted); margin-top: 4px; }
+
+  /* Spectrogram */
+  canvas#spec { width: 100%; height: 180px; display: block; border-radius: 6px;
+                image-rendering: pixelated; background: #000; }
+  .axis { display: flex; justify-content: space-between; font-size: 11px; color: var(--muted); margin-top: 4px; }
+
+  /* Classes */
+  .bars { display: grid; gap: 5px; }
+  .bar { display: grid; grid-template-columns: 70px 1fr 52px; align-items: center; gap: 8px; font-size: 13px; }
+  .bar .track { height: 14px; background: var(--panel2); border-radius: 4px; overflow: hidden; }
+  .bar .val { height: 100%; width: 0; background: #4a5568; transition: width .08s; }
+  .bar.kw .val { background: #5b8def; }
+  .bar.top .val { background: var(--accent); }
+  .bar.top .name { color: #fff; font-weight: 600; }
+  .bar .num { text-align: right; color: var(--muted); font-size: 12px; }
+  .margin { margin-top: 14px; }
+  .margin .track { position: relative; height: 14px; background: var(--panel2); border-radius: 4px; overflow: hidden; }
+  .margin .val { position: absolute; left: 0; top: 0; bottom: 0; background: #5b8def; transition: width .08s; }
+  .margin .thr { position: absolute; top: -2px; bottom: -2px; width: 2px; background: var(--warn); }
+
+  /* Timeline + log */
+  .timeline { display: flex; gap: 3px; flex-wrap: nowrap; overflow: hidden; }
+  .chip { min-width: 0; height: 26px; border-radius: 4px; font-size: 9px; display: grid; overflow: hidden;
+          place-items: center; background: var(--panel2); color: var(--muted); flex: 1 1 0; }
+  .chip.kw { background: #243554; color: #b9ccf5; }
+  .chip.win { background: #1f3a2d; color: #bdf0d5; }
+  .chip.det { outline: 2px solid var(--accent); }
+  .log { list-style: none; margin: 0; padding: 0; display: grid; gap: 6px; max-height: 220px; overflow: auto; }
+  .log li { display: flex; justify-content: space-between; background: var(--panel2);
+            border-radius: 6px; padding: 8px 10px; }
+  .log li b { font-size: 15px; letter-spacing: .03em; }
+  .log li span { color: var(--muted); font-size: 12px; }
+  .empty { color: var(--muted); font-size: 13px; }
+  .stats { display: flex; gap: 18px; flex-wrap: wrap; font-size: 12px; color: var(--muted); margin-top: 10px; }
+  .stats b { color: var(--text); font-weight: 500; }
+  .note { font-size: 12px; color: var(--muted); margin-top: 10px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Keyword spotting, live</h1>
+  <span class="sub">Your Mac mic through the FPGA's bit-exact integer pipeline</span>
+  <span id="status"><span class="dot"></span><span id="status-text">connecting</span></span>
+</header>
+<div id="warn"></div>
+
+<main>
+  <div class="stack">
+    <section class="panel board">
+      <h2>Nexys A7 (as it would look)</h2>
+      <div class="display" id="display"></div>
+      <div class="leds" id="leds"></div>
+      <div class="legend">LED 11:0 mic level &middot; 12 word shown &middot; 13 live &middot; 14 engine busy &middot; 15 heartbeat</div>
+    </section>
+
+    <section class="panel">
+      <h2>Switches</h2>
+      <div class="controls">
+        <div class="ctl">
+          <label>Mic gain (SW3:0, 6 dB steps). Aim for speech peaks in the green band.</label>
+          <div class="seg" id="gain"></div>
+          <div style="margin-top:10px">
+            <div class="meter"><div class="target" style="left:66.7%;width:16.7%"></div><div class="fill" id="meter"></div></div>
+            <div class="meter-row"><span>-60 dBFS</span><span class="mono" id="dbfs">-- dBFS</span><span>0</span></div>
+          </div>
+        </div>
+        <div class="ctl">
+          <label>Detection margin (SW5:4). Higher is stricter.</label>
+          <div class="seg" id="margin"></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>Detections</h2>
+      <ul class="log" id="log"><li class="empty" style="background:none;padding:0">Say "yes", "no", "up", "down", "left", "right", "on", "off", "stop" or "go".</li></ul>
+    </section>
+  </div>
+
+  <div class="stack">
+    <section class="panel">
+      <h2>Engine input: last 49 frames x 40 mel bands (int8)</h2>
+      <canvas id="spec" width="49" height="40"></canvas>
+      <div class="axis"><span>-0.98 s</span><span>now</span></div>
+    </section>
+
+    <section class="panel">
+      <h2>Latest inference</h2>
+      <div class="bars" id="bars"></div>
+      <div class="margin">
+        <div class="bar" style="grid-template-columns:70px 1fr 52px">
+          <span>margin</span>
+          <div class="track"><div class="val" id="margin-val"></div><div class="thr" id="margin-thr"></div></div>
+          <span class="num mono" id="margin-num">0</span>
+        </div>
+      </div>
+      <div class="stats">
+        <span>wins in a row <b class="mono" id="hits">0</b> / 3</span>
+        <span>inference <b class="mono" id="ims">-</b> ms on the Mac</span>
+        <span>inferences <b class="mono" id="count">0</b></span>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>Last 4 seconds of inferences (every 100 ms)</h2>
+      <div class="timeline" id="timeline"></div>
+      <div class="note">Blue: a keyword is on top. Green: it also beats the runner-up by the margin (a "win"). Outlined: detection.</div>
+    </section>
+  </div>
+</main>
+
+<script>
+// ---------------------------------------------------------------- 7-segment display
+// Same words and letter shapes as rtl/seg7_word.sv, bits {g,f,e,d,c,b,a}.
+const WORDS = ["SILENCE", "UNKNOWN", "YES", "NO", "UP", "DOWN", "LEFT", "RIGHT", "ON", "OFF", "STOP", "GO"];
+const GLYPH = { C: 0x39, D: 0x5E, E: 0x79, F: 0x71, G: 0x3D, H: 0x76, I: 0x30, K: 0x75, L: 0x38,
+                N: 0x54, O: 0x3F, P: 0x73, R: 0x50, S: 0x6D, T: 0x78, U: 0x3E, W: 0x1C, Y: 0x6E, "-": 0x40 };
+const SEGS = {  // a..g polygons in a 40 x 72 box
+  a: "8,4 32,4 28,8 12,8", b: "33,5 33,34 29,31 29,9", c: "33,38 33,67 29,63 29,41",
+  d: "8,68 32,68 28,64 12,64", e: "7,38 11,41 11,63 7,67", f: "7,5 11,9 11,31 7,34",
+  g: "9,36 13,33 27,33 31,36 27,39 13,39" };
+const display = document.getElementById("display");
+const digits = [];
+for (let i = 0; i < 8; i++) {
+  const d = document.createElement("div"); d.className = "digit";
+  d.innerHTML = `<svg viewBox="0 0 40 72">${Object.entries(SEGS).map(([k, p]) =>
+    `<polygon data-s="${k}" points="${p}"/>`).join("")}</svg>`;
+  display.appendChild(d); digits.push(d);
+}
+function showWord(text) {
+  const t = (text || "").padEnd(8).slice(0, 8);
+  digits.forEach((d, i) => {
+    const g = GLYPH[t[i]] || 0;
+    d.querySelectorAll("polygon").forEach(p => {
+      const bit = "abcdefg".indexOf(p.dataset.s);
+      p.classList.toggle("on", !!(g >> bit & 1));
+    });
+  });
+}
+showWord("");
+
+// ---------------------------------------------------------------- LEDs (LED15 on the left)
+const ledsEl = document.getElementById("leds");
+const leds = [];
+for (let i = 15; i >= 0; i--) {
+  const l = document.createElement("div"); l.className = "led";
+  l.innerHTML = `<i></i><span>${i}</span>`; ledsEl.appendChild(l); leds[i] = l.firstChild;
+}
+const ledState = new Array(16).fill(false);
+ledState[13] = true;
+function renderLeds() { leds.forEach((l, i) => l.classList.toggle("on", ledState[i])); }
+setInterval(() => { ledState[15] = !ledState[15]; renderLeds(); }, 671);  // 2^26 cycles at 100 MHz
+
+// ---------------------------------------------------------------- controls
+const post = body => fetch("/control", { method: "POST", body: JSON.stringify(body) });
+const gainEl = document.getElementById("gain");
+[-12, -6, 0, 6, 12, 18, 24, 30, 36].forEach(db => {
+  const b = document.createElement("button"); b.textContent = (db > 0 ? "+" : "") + db + " dB";
+  b.dataset.v = db; b.onclick = () => post({ gain_db: db }); gainEl.appendChild(b);
+});
+const marginEl = document.getElementById("margin");
+[["01", "2^17 sensitive"], ["00", "2^18 default"], ["10", "2^19 strict"], ["11", "off"]].forEach(([v, t]) => {
+  const b = document.createElement("button"); b.textContent = t; b.dataset.v = v;
+  b.onclick = () => post({ margin_sel: v }); marginEl.appendChild(b);
+});
+function markOn(el, v) { [...el.children].forEach(b => b.classList.toggle("on", b.dataset.v == v)); }
+
+// ---------------------------------------------------------------- spectrogram
+const spec = document.getElementById("spec"), sctx = spec.getContext("2d");
+const img = sctx.createImageData(49, 40);
+const STOPS = [[0, [0, 0, 4]], [0.25, [59, 15, 112]], [0.5, [140, 41, 129]],
+               [0.75, [222, 73, 104]], [0.9, [254, 159, 109]], [1, [252, 253, 191]]];
+function color(v) {  // int8 feature -> magma-like color
+  const t = Math.min(1, Math.max(0, (v + 40) / 120));
+  for (let i = 1; i < STOPS.length; i++) if (t <= STOPS[i][0]) {
+    const [t0, c0] = STOPS[i - 1], [t1, c1] = STOPS[i], f = (t - t0) / (t1 - t0);
+    return c0.map((c, k) => c + (c1[k] - c) * f);
+  }
+  return STOPS[STOPS.length - 1][1];
+}
+const rows = [];
+function drawSpec() {
+  for (let x = 0; x < 49; x++) for (let m = 0; m < 40; m++) {
+    const v = rows[x - (49 - rows.length)]?.[m] ?? -40, c = color(v), o = ((39 - m) * 49 + x) * 4;
+    img.data[o] = c[0]; img.data[o + 1] = c[1]; img.data[o + 2] = c[2]; img.data[o + 3] = 255;
+  }
+  sctx.putImageData(img, 0, 0);
+}
+
+// ---------------------------------------------------------------- classes
+let CLASSES = WORDS.map(w => w.toLowerCase());
+const barsEl = document.getElementById("bars");
+function buildBars() {
+  barsEl.innerHTML = CLASSES.map((c, i) => `<div class="bar ${i >= 2 ? "kw" : ""}" id="bar${i}">
+    <span class="name">${c}</span><div class="track"><div class="val"></div></div>
+    <span class="num mono">0%</span></div>`).join("");
+}
+buildBars();
+
+const timeline = document.getElementById("timeline");
+for (let i = 0; i < 40; i++) { const c = document.createElement("div"); c.className = "chip"; timeline.appendChild(c); }
+let count = 0, lastDetect = -1;
+
+function onInfer(e) {
+  count++;
+  document.getElementById("count").textContent = count;
+  document.getElementById("ims").textContent = e.infer_ms;
+  document.getElementById("hits").textContent = e.hits;
+  e.probs.forEach((p, i) => {
+    const b = document.getElementById("bar" + i);
+    b.classList.toggle("top", i === e.cls);
+    b.querySelector(".val").style.width = (p * 100).toFixed(1) + "%";
+    b.querySelector(".num").textContent = (p * 100).toFixed(0) + "%";
+  });
+  const scale = Math.max(4 * e.threshold_f, 8);
+  document.getElementById("margin-val").style.width = Math.min(100, 100 * e.margin_f / scale) + "%";
+  document.getElementById("margin-thr").style.left = Math.min(100, 100 * e.threshold_f / scale) + "%";
+  document.getElementById("margin-num").textContent = e.margin_f.toFixed(2);
+
+  const chip = timeline.firstChild; timeline.appendChild(chip);
+  chip.className = "chip" + (e.cls >= 2 ? " kw" : "") + (e.win >= 2 ? " win" : "") + (lastDetect === count ? " det" : "");
+  chip.textContent = CLASSES[e.cls].slice(0, 4);
+
+  ledState[14] = true; renderLeds(); setTimeout(() => { ledState[14] = false; renderLeds(); }, 60);
+  ledState[12] = e.showing;
+  showWord(e.showing ? WORDS[e.show_class] : "");
+}
+
+const logEl = document.getElementById("log");
+function onDetect(e) {
+  lastDetect = count + 1;
+  if (logEl.querySelector(".empty")) logEl.innerHTML = "";
+  const li = document.createElement("li");
+  li.innerHTML = `<b>${e.word.toUpperCase()}</b><span>${new Date(e.t * 1000).toLocaleTimeString()}</span>`;
+  logEl.prepend(li);
+  while (logEl.children.length > 30) logEl.lastChild.remove();
+  ledState[12] = true; showWord(WORDS[e.cls]); renderLeds();
+}
+
+function onFrame(e) {
+  frames.push(e.q); if (frames.length > 49) frames.shift();
+  rows.length = 0; frames.forEach(r => rows.push(r)); drawSpec();
+  for (let i = 0; i < 12; i++) ledState[i] = e.level > i + 3;
+  renderLeds();
+  const pct = Math.max(0, Math.min(100, (e.dbfs + 60) / 60 * 100));
+  document.getElementById("meter").style.width = pct + "%";
+  document.getElementById("dbfs").textContent = e.dbfs.toFixed(1) + " dBFS";
+}
+const frames = [];
+
+// ---------------------------------------------------------------- events
+const statusEl = document.getElementById("status"), statusText = document.getElementById("status-text");
+const warnEl = document.getElementById("warn");
+function connect() {
+  const es = new EventSource("/events");
+  es.onopen = () => { statusEl.className = "live"; statusText.textContent = "listening"; };
+  es.onerror = () => { statusEl.className = ""; statusText.textContent = "disconnected, retrying"; };
+  es.onmessage = m => {
+    const e = JSON.parse(m.data);
+    if (e.type === "frame") { onFrame(e); if (e.level > 0) warnEl.style.display = "none"; }
+    else if (e.type === "infer") onInfer(e);
+    else if (e.type === "detect") onDetect(e);
+    else if (e.type === "state") {
+      markOn(gainEl, e.gain_db); markOn(marginEl, e.margin_sel);
+      if (e.classes) { CLASSES = e.classes; buildBars(); }
+    }
+    else if (e.type === "warn") { warnEl.textContent = e.msg; warnEl.style.display = "block"; }
+  };
+}
+connect();
+drawSpec();
+</script>
+</body>
+</html>

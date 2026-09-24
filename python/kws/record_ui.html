@@ -1,0 +1,161 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Board recorder</title>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #171a21; --panel2: #1e222b; --line: #2a2f3a;
+    --text: #e6e8ec; --muted: #8b93a3; --accent: #4cc38a; --warn: #f0b44c; --rec: #ff4d4f;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 15px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  .wrap { max-width: 880px; margin: 0 auto; padding: 20px 16px 40px; }
+  h1 { font-size: 20px; margin: 0 0 4px; font-weight: 600; }
+  .sub { color: var(--muted); margin: 0 0 18px; font-size: 14px; }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 16px; margin-bottom: 16px; }
+  .panel h2 { margin: 0 0 12px; font-size: 12px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); }
+  .switches { display: flex; flex-wrap: wrap; gap: 8px; }
+  .sw { background: var(--panel2); border: 1px solid var(--line); border-radius: 6px; padding: 4px 10px; font-size: 13px; }
+  .sw.up { border-color: var(--accent); color: #bdf0d5; }
+  .meter { position: relative; height: 18px; background: var(--panel2); border-radius: 9px; overflow: hidden; }
+  .meter .fill { position: absolute; inset: 0 auto 0 0; width: 0; background: var(--accent); transition: width .08s; }
+  .meter .fill.hot { background: var(--warn); }
+  .meter .target { position: absolute; top: 0; bottom: 0; left: 66.7%; width: 25%;
+                   background: rgba(76,195,138,.15); border-left: 1px dashed var(--accent); border-right: 1px dashed var(--accent); }
+  .meter-row { display: flex; justify-content: space-between; color: var(--muted); font-size: 12px; margin-top: 6px; }
+  #nosignal { color: var(--warn); font-size: 13px; margin-top: 8px; display: none; }
+  .buttons { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 10px; }
+  .buttons button { background: var(--panel2); color: var(--text); border: 1px solid var(--line); border-radius: 10px;
+                    padding: 14px 12px; font: inherit; cursor: pointer; text-align: left; }
+  .buttons button:hover:not(:disabled) { border-color: #3d4452; }
+  .buttons button:disabled { opacity: .45; cursor: default; }
+  .buttons b { display: block; font-size: 16px; }
+  .buttons span { color: var(--muted); font-size: 12px; }
+  .stage { text-align: center; padding: 30px 12px; min-height: 180px; display: grid; place-items: center; }
+  .stage .prompt { font-size: 44px; font-weight: 700; letter-spacing: .01em; transition: color .15s, transform .15s; }
+  .stage .prompt.flash { color: var(--rec); transform: scale(1.06); }
+  .stage .hint { color: var(--muted); margin-top: 8px; }
+  .stage .countdown { color: var(--muted); font-variant-numeric: tabular-nums; margin-top: 12px; }
+  .dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; background: var(--rec); margin-right: 8px; animation: blink 1s infinite; }
+  @keyframes blink { 50% { opacity: .2; } }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  td { padding: 8px 6px; border-top: 1px solid var(--line); vertical-align: middle; }
+  td.num { color: var(--muted); font-variant-numeric: tabular-nums; }
+  td audio { height: 32px; width: 100%; min-width: 180px; }
+  .del { background: none; border: 1px solid var(--line); color: var(--muted); border-radius: 6px; padding: 4px 10px; cursor: pointer; font: inherit; font-size: 13px; }
+  .del:hover { color: var(--rec); border-color: var(--rec); }
+  .counts { display: flex; gap: 14px; flex-wrap: wrap; color: var(--muted); font-size: 13px; margin-bottom: 10px; }
+  .counts b { color: var(--text); }
+  .msg { font-size: 14px; margin-top: 10px; min-height: 20px; }
+  .msg.err { color: var(--warn); }
+  .msg.ok { color: var(--accent); }
+  @media (max-width: 560px) { .stage .prompt { font-size: 32px; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Board recorder</h1>
+  <p class="sub">Test clips of your voice through the Nexys A7 microphone. They are only used to measure the model, never to train it.</p>
+
+  <div class="panel">
+    <h2>Board switches</h2>
+    <div class="switches">
+      <span class="sw up">SW15 up (live)</span><span class="sw up">SW14 up (record)</span>
+      <span class="sw up">SW2 up (gain 4)</span><span class="sw">all others down</span>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>Microphone level</h2>
+    <div class="meter"><div class="target"></div><div class="fill" id="fill"></div></div>
+    <div class="meter-row"><span>-60 dBFS</span><span id="db">waiting for audio…</span><span>0</span></div>
+    <div id="nosignal">No audio from the board. Check that SW15 and SW14 are up.</div>
+  </div>
+
+  <div class="panel">
+    <h2>Record</h2>
+    <div class="buttons" id="buttons"></div>
+    <div class="stage" id="stage"><div><div class="prompt" id="prompt">Pick what to record</div>
+      <div class="hint" id="hint">Speak about arm's length from the board.</div>
+      <div class="countdown" id="countdown"></div></div></div>
+    <div class="msg" id="msg"></div>
+  </div>
+
+  <div class="panel">
+    <h2>Saved takes</h2>
+    <div class="counts" id="counts"></div>
+    <table id="files"><tbody></tbody></table>
+  </div>
+</div>
+
+<script>
+let labels = {}, recording = null, timer = null;
+const $ = id => document.getElementById(id);
+const post = (path, body) => fetch(path, { method: "POST", body: JSON.stringify(body || {}) });
+
+function renderButtons() {
+  $("buttons").innerHTML = Object.entries(labels).map(([k, v]) =>
+    `<button data-k="${k}" ${recording ? "disabled" : ""}><b>${v.title}</b>
+     <span>${v.seconds} s${v.every ? ` · prompt every ${v.every} s` : ""}</span></button>`).join("");
+  $("buttons").querySelectorAll("button").forEach(b => b.onclick = () => { $("msg").textContent = ""; post("/record", { label: b.dataset.k }); });
+}
+
+function renderFiles(files) {
+  const counts = {};
+  files.forEach(f => counts[f.label] = (counts[f.label] || 0) + 1);
+  $("counts").innerHTML = Object.entries(labels).map(([k, v]) => `<span>${v.title}: <b>${counts[k] || 0}</b></span>`).join("");
+  $("files").querySelector("tbody").innerHTML = files.length ? files.map(f => `<tr>
+      <td>${f.name}</td><td class="num">${f.seconds} s</td>
+      <td><audio controls preload="none" src="/audio/${f.name}"></audio></td>
+      <td><button class="del" data-n="${f.name}">Delete</button></td></tr>`).join("")
+    : `<tr><td class="num">Nothing recorded yet.</td></tr>`;
+  $("files").querySelectorAll(".del").forEach(b => b.onclick = () => post("/delete", { name: b.dataset.n }));
+}
+
+function runStage() {
+  clearInterval(timer);
+  if (!recording) { $("prompt").textContent = "Pick what to record"; $("prompt").classList.remove("flash");
+    $("hint").textContent = "Speak about arm's length from the board."; $("countdown").textContent = ""; return; }
+  const r = recording, start = Date.now();
+  let lastPrompt = -1;
+  $("hint").innerHTML = `<span class="dot"></span>Recording ${r.title.toLowerCase()}`;
+  timer = setInterval(() => {
+    const t = (Date.now() - start) / 1000, left = Math.max(0, r.seconds - t);
+    $("countdown").textContent = `${left.toFixed(0)} s left`;
+    if (r.every) {
+      const k = Math.floor((t - 0.8) / r.every);  // first prompt after a short lead-in
+      if (k >= 0 && k !== lastPrompt && t < r.seconds - 1) {
+        lastPrompt = k;
+        $("prompt").textContent = `Say: ${r.prompt}`;
+        $("prompt").classList.add("flash");
+        setTimeout(() => { $("prompt").classList.remove("flash"); $("prompt").textContent = "…"; }, 900);
+      } else if (k < 0) $("prompt").textContent = "Get ready…";
+    } else {
+      $("prompt").textContent = r.prompt;
+    }
+    if (left <= 0) clearInterval(timer);
+  }, 100);
+}
+
+const es = new EventSource("/events");
+es.onmessage = m => {
+  const e = JSON.parse(m.data);
+  if (e.type === "level") {
+    if (e.dbfs === null) { $("nosignal").style.display = "block"; $("db").textContent = "no audio"; $("fill").style.width = "0"; return; }
+    $("nosignal").style.display = "none";
+    const pct = Math.max(0, Math.min(100, (e.dbfs + 60) / 60 * 100));
+    $("fill").style.width = pct + "%"; $("fill").classList.toggle("hot", e.dbfs > -3);
+    $("db").textContent = `${e.dbfs.toFixed(1)} dBFS`;
+  } else if (e.type === "state") {
+    labels = e.labels; recording = e.recording;
+    renderButtons(); renderFiles(e.files); runStage();
+    if (e.saved) { $("msg").className = "msg ok"; $("msg").textContent = `Saved ${e.saved}`; }
+    if (e.error) { $("msg").className = "msg err"; $("msg").textContent = e.error; }
+  }
+};
+</script>
+</body>
+</html>

@@ -19,7 +19,7 @@ from test_top import TOP_SOURCES
 
 ROOT = Path(__file__).resolve().parents[1]
 BUILD = ROOT / "build" / "sim_live"
-CLK_DIV = 4          # PDM clock = clk / 8 here (clk / 50 on the board)
+PDM_PERIOD = 8       # clocks per PDM bit here (25 on the board, at 50 MHz)
 GAIN = 6
 LEVEL = 2**-6        # speech level at the mic, relative to full scale
 WORDS = ["yes", "stop", "go", "left"]
@@ -132,7 +132,7 @@ def test_live():
         build_dir=BUILD,
         always=True,
         parameters={"BITS_FILE": f'"{BUILD / "pdm_bits.hex"}"', "N_WORDS": n_words,
-                    "CLK_DIV": CLK_DIV},
+                    "PDM_PERIOD": PDM_PERIOD},
         build_args=["--public-flat-rw", "-Wno-fatal", "-Wno-WIDTHEXPAND", "-Wno-UNUSEDSIGNAL",
                     "-O3", f'-DKWS_MEM_DIR="{ROOT}/rtl/gen/"'],
     )

@@ -4,7 +4,7 @@
 module tb_live #(
   parameter string BITS_FILE   = "",
   parameter int    N_WORDS     = 1,      // 32 bits per word, LSB first
-  parameter int    CLK_DIV     = 4,
+  parameter int    PDM_PERIOD  = 8,
   parameter int    HOLD_CYCLES = 1
 ) (
   input  logic        clk,
@@ -30,7 +30,7 @@ module tb_live #(
     else if (!done_playing) idx <= idx + 1;
   end
 
-  kws_top #(.CLKS_PER_BIT(8), .CLK_DIV(CLK_DIV), .HOLD_CYCLES(HOLD_CYCLES)) u_top (
+  kws_top #(.SYS_DIV(1), .CLKS_PER_BIT(8), .PDM_PERIOD(PDM_PERIOD), .HOLD_CYCLES(HOLD_CYCLES)) u_top (
     .clk, .rst_n, .uart_rx(1'b1), .uart_tx, .sw, .m_clk, .m_lrsel, .m_data,
     .led, .seg, .dp, .an);
 endmodule

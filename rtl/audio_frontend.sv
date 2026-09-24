@@ -4,9 +4,9 @@
 //
 // Per frame, sequentially (~18k cycles, far below the 320-sample frame period):
 //   WIN   window the last FFT_N samples (Hann, Q15) into the FFT RAM in bit-reversed order
-//   FFT   in-place radix-2 DIT, one butterfly every 7 cycles
+//   FFT   in-place radix-2 DIT, one butterfly every 8 cycles
 //   POW   power of bins 0..FFT_N/2 into the power RAM
-//   MEL   walk the sparse mel ROM {last, weight, bin}, accumulate, then log2 -> int8
+//   MEL   walk the sparse mel ROM {weight, bin} (+ a last-in-band bit), accumulate, log2 -> int8
 // Outputs one (band, value) pair per band, then frame_done.
 
 `ifndef KWS_MEM_DIR
@@ -25,7 +25,13 @@ module audio_frontend
   output logic              feat_valid,
   output logic [5:0]        feat_band,
   output logic signed [7:0] feat_q,
-  output logic              frame_done
+  output logic              frame_done,
+  // Debug summary of the last frame: the OR of all windowed-sample magnitudes and of all
+  // power values (their leading one = the largest value's), and the number of features
+  // the frame produced (should be 40). ORs, not maxima, to stay off the critical path.
+  output logic [31:0]       dbg_win_or,
+  output logic [48:0]       dbg_pow_or,
+  output logic [5:0]        dbg_nfeat
 );
   localparam int NBINS = FFT_N / 2 + 1;
 
@@ -75,20 +81,25 @@ module audio_frontend
   logic [48:0] pow_rdata, pow_wdata;
   logic        pow_we;
   logic [8:0]  mel_raddr;
-  logic [18:0] mel_rdata;              // {last, weight[8:0], bin[8:0]}
+  logic [17:0] mel_rdata;              // {weight[8:0], bin[8:0]}
+  logic        mel_last;               // last entry of its band
   logic [7:0]  lut_raddr;
   logic [6:0]  lut_rdata;
 
   sdp_ram #(.WIDTH(16), .DEPTH(FFT_N), .INIT({MEM_DIR, "fe_hann.hex"}), .STYLE("block")) u_hann (
     .clk, .we(1'b0), .waddr('0), .wdata('0), .raddr(hann_raddr), .rdata(hann_rdata));
-  sdp_ram #(.WIDTH(50), .DEPTH(FFT_N)) u_fft (
+  // The FFT and power RAMs are LUT RAM: written RAMB36 block RAMs misbehaved on the board
+  // with the open-source flow (the RAMB18-sized RAMs are fine).
+  sdp_ram #(.WIDTH(50), .DEPTH(FFT_N), .STYLE("distributed")) u_fft (
     .clk, .we(fft_we), .waddr(fft_waddr), .wdata(fft_wdata), .raddr(fft_raddr), .rdata(fft_rdata));
   sdp_ram #(.WIDTH(36), .DEPTH(FFT_N / 2), .INIT({MEM_DIR, "fe_twiddle.hex"}), .STYLE("block")) u_tw (
     .clk, .we(1'b0), .waddr('0), .wdata('0), .raddr(tw_raddr), .rdata(tw_rdata));
-  sdp_ram #(.WIDTH(49), .DEPTH(FFT_N)) u_pow (
+  sdp_ram #(.WIDTH(49), .DEPTH(FFT_N), .STYLE("distributed")) u_pow (
     .clk, .we(pow_we), .waddr(pow_waddr), .wdata(pow_wdata), .raddr(pow_raddr), .rdata(pow_rdata));
-  sdp_ram #(.WIDTH(19), .DEPTH(MEL_ENTRIES), .INIT({MEM_DIR, "fe_mel.hex"}), .STYLE("block")) u_mel (
+  sdp_ram #(.WIDTH(18), .DEPTH(MEL_ENTRIES), .INIT({MEM_DIR, "fe_mel.hex"}), .STYLE("block")) u_mel (
     .clk, .we(1'b0), .waddr('0), .wdata('0), .raddr(mel_raddr), .rdata(mel_rdata));
+  sdp_ram #(.WIDTH(1), .DEPTH(MEL_ENTRIES), .INIT({MEM_DIR, "fe_mel_last.hex"})) u_mel_last (
+    .clk, .we(1'b0), .waddr('0), .wdata('0), .raddr(mel_raddr), .rdata(mel_last));
   sdp_ram #(.WIDTH(7), .DEPTH(256), .INIT({MEM_DIR, "fe_log2.hex"}), .STYLE("block")) u_log2 (
     .clk, .we(1'b0), .waddr('0), .wdata('0), .raddr(lut_raddr), .rdata(lut_rdata));
 
@@ -102,7 +113,7 @@ module audio_frontend
   logic [9:0] n;        // WIN: sample index; POW: bin; MEL: ROM entry
   logic [3:0] stage;    // FFT stage 0..8
   logic [7:0] bfly;     // FFT butterfly index within the stage
-  logic [2:0] bstep;    // FFT butterfly sub-step 0..6
+  logic [2:0] bstep;    // FFT butterfly sub-step 0..7
   logic       issuing;  // WIN/POW/MEL: still issuing indices
 
   // Butterfly addresses for (stage, bfly)
@@ -132,8 +143,8 @@ module audio_frontend
   // ---------------------------------------------------------------------------------------
   // POW pipeline: issue k -> data -> squares -> write
   // ---------------------------------------------------------------------------------------
-  logic               q1_valid, q2_valid;
-  logic [8:0]         q1_k, q2_k;
+  logic               q0_valid, q1_valid, q2_valid;
+  logic [8:0]         q0_k, q1_k, q2_k;
   logic [49:0]        q2_re2, q2_im2;
 
   // ---------------------------------------------------------------------------------------
@@ -152,6 +163,10 @@ module audio_frontend
   logic [5:0]  band;
 
   assign pow_raddr = 9'(mel_rdata[8:0]);  // E1: the entry's bin addresses the power RAM
+
+  logic [31:0] win_or;
+  logic [48:0] pow_or;
+  logic [5:0]  nfeat;
 
   always_ff @(posedge clk) begin
     fft_we     <= 1'b0;
@@ -180,33 +195,34 @@ module audio_frontend
       F_FFT: begin
         bstep <= bstep + 1'b1;
         unique case (bstep)
-          3'd0: ;                                         // read a, twiddle
-          3'd1: begin                                     // read b; a and w arrive
+          // The read address is registered (see below): a is read in step 1, b in step 2.
+          3'd0, 3'd1: ;
+          3'd2: begin                                     // a and the twiddle arrive
             ar <= $signed(fft_rdata[24:0]);
             ai <= $signed(fft_rdata[49:25]);
             wr <= $signed(tw_rdata[17:0]);
             wi <= $signed(tw_rdata[35:18]);
           end
-          3'd2: begin                                     // b arrives
+          3'd3: begin                                     // b arrives
             br <= $signed(fft_rdata[24:0]);
             bi <= $signed(fft_rdata[49:25]);
           end
-          3'd3: begin
+          3'd4: begin
             p_rr <= wr * br;
             p_ii <= wi * bi;
             p_ri <= wr * bi;
             p_ir <= wi * br;
           end
-          3'd4: begin
+          3'd5: begin
             tr <= 25'((p_rr - p_ii + 43'sd32768) >>> 16);
             ti <= 25'((p_ri + p_ir + 43'sd32768) >>> 16);
           end
-          3'd5: begin
+          3'd6: begin
             fft_we    <= 1'b1;
             fft_waddr <= ia;
             fft_wdata <= {25'(ai + ti), 25'(ar + tr)};
           end
-          default: begin                                  // 3'd6
+          default: begin                                  // 3'd7
             fft_we    <= 1'b1;
             fft_waddr <= ib;
             fft_wdata <= {25'(ai - ti), 25'(ar - tr)};
@@ -227,7 +243,7 @@ module audio_frontend
         if (issuing) begin
           if (n == 10'(NBINS - 1)) issuing <= 1'b0;
           n <= n + 1'b1;
-        end else if (!q1_valid && !q2_valid && !pow_we) begin
+        end else if (!q0_valid && !q1_valid && !q2_valid && !pow_we) begin
           n       <= '0;
           issuing <= 1'b1;
           state   <= F_MEL;
@@ -245,8 +261,11 @@ module audio_frontend
       end
 
       F_DONE: begin
-        frame_done <= 1'b1;
-        state      <= F_IDLE;
+        frame_done  <= 1'b1;
+        state       <= F_IDLE;
+        dbg_win_or  <= win_or;
+        dbg_pow_or  <= pow_or;
+        dbg_nfeat   <= nfeat;
       end
 
       default: state <= F_IDLE;
@@ -259,19 +278,23 @@ module audio_frontend
     w2_n     <= w1_n;
     w2_prod  <= $signed(pcm_rdata) * $signed({1'b0, hann_rdata});
     if (w2_valid) begin
+      win_or <= win_or | (w2_prod[31] ? ~w2_prod : w2_prod);  // |x| up to one LSB
       fft_we    <= 1'b1;
       fft_waddr <= bitrev9(w2_n);
       fft_wdata <= {25'sd0, 25'((w2_prod + 32'sd16384) >>> 15)};
     end
 
     // ---------------- POW datapath ----------------
-    q1_valid <= state == F_POW && issuing;
-    q1_k     <= n[8:0];
+    q0_valid <= state == F_POW && issuing;  // the FFT RAM address is registered: one more stage
+    q0_k     <= n[8:0];
+    q1_valid <= q0_valid;
+    q1_k     <= q0_k;
     q2_valid <= q1_valid;
     q2_k     <= q1_k;
     q2_re2   <= 50'($signed(fft_rdata[24:0]) * $signed(fft_rdata[24:0]));
     q2_im2   <= 50'($signed(fft_rdata[49:25]) * $signed(fft_rdata[49:25]));
     if (q2_valid) begin
+      pow_or <= pow_or | 49'(q2_re2 + q2_im2);
       pow_we    <= 1'b1;
       pow_waddr <= q2_k;
       pow_wdata <= 49'(q2_re2 + q2_im2);
@@ -280,7 +303,7 @@ module audio_frontend
     // ---------------- MEL datapath ----------------
     e1_valid <= state == F_MEL && issuing;
     e2_valid <= e1_valid;
-    e2_last  <= mel_rdata[18];
+    e2_last  <= mel_last;
     e2_w     <= mel_rdata[17:9];
     e3_valid <= e2_valid;
     e3_last  <= e2_last;
@@ -318,16 +341,20 @@ module audio_frontend
       feat_band  <= band;
       feat_valid <= 1'b1;
       band       <= band + 1'b1;
+      nfeat      <= nfeat + 1'b1;
     end
 
     if (state == F_IDLE) begin
       band       <= '0;
       band_first <= 1'b1;
+      win_or     <= '0;
+      pow_or     <= '0;
+      nfeat      <= '0;
     end
 
     if (rst) begin
       state <= F_IDLE;
-      {w1_valid, w2_valid, q1_valid, q2_valid, e1_valid, e2_valid, e3_valid} <= '0;
+      {w1_valid, w2_valid, q0_valid, q1_valid, q2_valid, e1_valid, e2_valid, e3_valid} <= '0;
       {l0_valid, la_valid, l1_valid, l2_valid, l3_valid} <= '0;
     end
   end
@@ -339,6 +366,8 @@ module audio_frontend
     hann_raddr = n[8:0];
     tw_raddr   = tw_k;
     mel_raddr  = n[8:0];
-    fft_raddr  = state == F_FFT ? (bstep == 3'd0 ? ia : ib) : n[8:0];
   end
+
+  // Registered: the FFT RAM is LUT RAM and its address fans out to all 50 bits.
+  always_ff @(posedge clk) fft_raddr <= state == F_FFT ? (bstep == 3'd0 ? ia : ib) : n[8:0];
 endmodule

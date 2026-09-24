@@ -33,7 +33,7 @@ SOURCES=(
 step() { echo "==> $1"; }
 
 step "sv2v"
-sv2v -DKWS_MEM_DIR="\"$ROOT/rtl/gen/\"" "${SOURCES[@]}" > "$OUT/kws_top.v"
+sv2v -DSYNTHESIS -DKWS_MEM_DIR="\"$ROOT/rtl/gen/\"" "${SOURCES[@]}" > "$OUT/kws_top.v"
 
 step "yosys (log: build/bit/yosys.log)"
 yosys -q -l "$OUT/yosys.log" -p "
@@ -53,21 +53,28 @@ for seed in $SEEDS; do
     --json "$OUT/kws_top.json" \
     --fasm "$OUT/seed$seed/kws_top.fasm" \
     --report "$OUT/seed$seed/report.json" \
-    --freq 100 --seed "$seed" \
+    --freq 50 --seed "$seed" \
     --log "$OUT/seed$seed/nextpnr.log" -q > /dev/null 2>&1 &
 done
 wait
-best=""; best_mhz=0
+# Each seed's margin: the worst ratio of achieved to required frequency over all clocks.
+best=""; best_margin=0
 for seed in $SEEDS; do
-  mhz=$(grep "Max frequency for clock" "$OUT/seed$seed/nextpnr.log" | tail -1 | sed -E 's/.*: ([0-9.]+) MHz.*/\1/')
-  echo "    seed $seed: ${mhz:-failed} MHz"
-  if [[ -n "$mhz" ]] && awk "BEGIN{exit !($mhz > $best_mhz)}"; then best=$seed; best_mhz=$mhz; fi
+  # nextpnr prints each clock before and after routing; keep the last line per clock.
+  margin=$(grep "Max frequency for clock" "$OUT/seed$seed/nextpnr.log" | \
+    sed -E "s/.*clock +'([^']*)': ([0-9.]+) MHz \\((PASS|FAIL) at ([0-9.]+) MHz.*/\\1 \\2 \\4/" | \
+    awk 'NF == 3 {f[$1] = $2; t[$1] = $3} END {m = 1e9; for (c in f) if (f[c] / t[c] < m) {m = f[c] / t[c]; w = c}
+         if (m < 1e9) printf "%.3f %s", m, w}')
+  echo "    seed $seed: ${margin:-failed} (achieved/required, worst clock)"
+  m=${margin%% *}
+  if [[ -n "$m" ]] && awk "BEGIN{exit !($m > $best_margin)}"; then best=$seed; best_margin=$m; fi
 done
 [[ -n "$best" ]] || { echo "nextpnr failed for every seed"; exit 1; }
 cp "$OUT/seed$best/kws_top.fasm" "$OUT/kws_top.fasm"
 cp "$OUT/seed$best/nextpnr.log" "$OUT/nextpnr.log"
 cp "$OUT/seed$best/report.json" "$OUT/report.json"
-echo "    using seed $best: $best_mhz MHz $(awk "BEGIN{print ($best_mhz >= 100 ? \"(meets 100 MHz)\" : \"(DOES NOT MEET 100 MHz)\")}")"
+grep "Max frequency for clock" "$OUT/nextpnr.log" | tail -2 | sed 's/^Info: */      /'
+echo "    using seed $best: margin $best_margin $(awk "BEGIN{print ($best_margin >= 1 ? \"(meets timing)\" : \"(DOES NOT MEET TIMING)\")}")"
 
 step "fasm2frames"
 "$OPENXC7/venv/bin/python" "$OPENXC7/prjxray/utils/fasm2frames.py" \
@@ -78,7 +85,7 @@ step "xc7frames2bit"
   --part_file "$DB/$PART/part.yaml" --part_name "$PART" \
   --frm_file "$OUT/kws_top.frames" --output_file "$OUT/kws_top.bit"
 
-echo "Bitstream: build/bit/kws_top.bit (seed $best, $best_mhz MHz)"
+echo "Bitstream: build/bit/kws_top.bit (seed $best, timing margin $best_margin)"
 
 if [[ "${1:-}" == "program" ]]; then
   step "openFPGALoader"

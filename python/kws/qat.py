@@ -12,7 +12,7 @@ import torch
 from torch import nn
 
 from .config import CKPT_DIR
-from .data import Split
+from .data import make_splits
 from .features import LogMel
 from .model import DSCNN
 from .quant import QDSCNN, describe, int_forward, quantize_input
@@ -27,12 +27,16 @@ def main():
     p.add_argument("--lr", type=float, default=5e-4)
     p.add_argument("--float-ckpt", default="dscnn_float.pt")
     p.add_argument("--out", default="dscnn_int8.pt")
+    p.add_argument("--data", default="real", choices=["real", "tts", "tts+real"])
+    p.add_argument("--extra-frac", type=float, default=0.2,
+                   help="TTS recipes: unknown and silence clips per epoch, relative to keywords")
+    p.add_argument("--realism", action="store_true")
     args = p.parse_args()
 
     device = pick_device()
     torch.manual_seed(0)
-    train = Split("train", device, gain_db=args.gain_db)
-    val, test = Split("val", device), Split("test", device)
+    train, val, test = make_splits(args.data, device, gain_db=args.gain_db, realism=args.realism,
+                                   extra_frac=args.extra_frac)
 
     ckpt = torch.load(CKPT_DIR / args.float_ckpt)
     model, frontend = DSCNN(), LogMel()

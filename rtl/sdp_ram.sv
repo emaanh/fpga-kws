@@ -1,6 +1,6 @@
 // Simple dual-port RAM with synchronous read (1-cycle latency).
-// With we tied low and INIT set, it is a ROM. STYLE "block" forces block RAM; "auto" lets
-// synthesis choose (small memories may become LUT RAM).
+// With we tied low and INIT set, it is a ROM. STYLE "block" forces block RAM, "distributed"
+// forces LUT RAM, "auto" lets synthesis choose.
 module sdp_ram #(
   parameter int    WIDTH = 8,
   parameter int    DEPTH = 1024,
@@ -16,6 +16,15 @@ module sdp_ram #(
 );
   if (STYLE == "block") begin : g_block
     (* ram_style = "block", rom_style = "block" *) logic [WIDTH-1:0] mem [DEPTH];
+
+    initial if (INIT != "") $readmemh(INIT, mem);
+
+    always_ff @(posedge clk) begin
+      if (we) mem[waddr] <= wdata;
+      rdata <= mem[raddr];
+    end
+  end else if (STYLE == "distributed") begin : g_dist
+    (* ram_style = "distributed" *) logic [WIDTH-1:0] mem [DEPTH];
 
     initial if (INIT != "") $readmemh(INIT, mem);
 

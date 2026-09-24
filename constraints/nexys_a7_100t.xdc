@@ -1,7 +1,9 @@
 # Nexys A7-100T pins used by kws_top (from Digilent's Nexys-A7-100T-Master.xdc).
 
 set_property -dict { PACKAGE_PIN E3  IOSTANDARD LVCMOS33 } [get_ports { clk }]
-create_clock -period 10.000 -name sys_clk [get_ports { clk }]
+create_clock -period 10.000 -name board_clk [get_ports { clk }]
+# The design runs on the board clock divided by 2 (kws_top SYS_DIV).
+create_clock -period 20.000 -name sys_clk [get_nets { sys_clk }]
 
 set_property -dict { PACKAGE_PIN C12 IOSTANDARD LVCMOS33 } [get_ports { rst_n }]
 
@@ -46,7 +48,7 @@ set_property -dict { PACKAGE_PIN T14 IOSTANDARD LVCMOS33 } [get_ports { an[5] }]
 set_property -dict { PACKAGE_PIN K2  IOSTANDARD LVCMOS33 } [get_ports { an[6] }]
 set_property -dict { PACKAGE_PIN U13 IOSTANDARD LVCMOS33 } [get_ports { an[7] }]
 
-# Slide switches: 15 live mode, 14 record (stream PCM), 13 mic sample edge,
+# Slide switches: 15 live mode, 14 record (stream PCM), 13 mic sample edge, 12 audio from host,
 # 5:4 detection margin, 3:0 mic gain
 set_property -dict { PACKAGE_PIN J15 IOSTANDARD LVCMOS33 } [get_ports { sw[0] }]
 set_property -dict { PACKAGE_PIN L16 IOSTANDARD LVCMOS33 } [get_ports { sw[1] }]

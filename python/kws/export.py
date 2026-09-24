@@ -84,14 +84,22 @@ def write_frontend_roms():
     write_hex("fe_hann.hex", to_hex_words(HANN_Q15.reshape(-1, 1), 16))
     write_hex("fe_twiddle.hex", to_hex_words(np.stack([TW_RE, TW_IM], 1), 18))
     write_hex("fe_log2.hex", to_hex_words(LOG2_LUT.reshape(-1, 1), 7))
-    # Mel entries in band order: {last_in_band, weight(9), bin(9)}.
-    entries = []
+    # Mel entries in band order: {weight(9), bin(9)}, plus a separate 1-bit "last in band"
+    # ROM. (A single 19-bit ROM lost its top bit in yosys' block RAM mapping.)
+    entries, last = [], []
     for m in range(MEL_Q8.shape[1]):
         nz = np.nonzero(MEL_Q8[:, m])[0]
         for j, k in enumerate(nz):
-            entries.append((int(j == len(nz) - 1) << 18) | (int(MEL_Q8[k, m]) << 9) | int(k))
-    write_hex("fe_mel.hex", to_hex_words(np.array(entries).reshape(-1, 1), 19))
+            entries.append((int(MEL_Q8[k, m]) << 9) | int(k))
+            last.append(int(j == len(nz) - 1))
+    write_hex("fe_mel.hex", to_hex_words(np.array(entries).reshape(-1, 1), 18))
+    write_hex("fe_mel_last.hex", to_hex_words(np.array(last).reshape(-1, 1), 1))
     return len(entries)
+
+
+def display_text(word):
+    """8-character 7-segment text for a class name ("M" is drawn as two "n"s)."""
+    return word.strip("_").upper().replace("M", "NN")[:8].ljust(8)
 
 
 def write_package(params, bases, n_mel_entries):
@@ -124,6 +132,8 @@ package kws_pkg;
   localparam int          LAYER_WBASE[N_LAYERS] = '{{{base_list}}};
 
   // For reference only (e.g. testbench printouts): {classes}
+  // What the 7-segment display shows for each class, 8 characters, left-aligned.
+  localparam logic [63:0] CLASS_TEXT [N_CLASSES] = '{{{", ".join('"' + display_text(c) + '"' for c in CLASSES)}}};
 
   // Mic path (python/kws/mic_model.py)
   localparam int CIC_R       = {CIC_R};

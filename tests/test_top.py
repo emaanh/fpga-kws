@@ -91,7 +91,7 @@ def test_top():
         hdl_toplevel="kws_top",
         build_dir=build_dir,
         always=True,
-        parameters={"CLKS_PER_BIT": CLKS_PER_BIT, "RX_TIMEOUT": RX_TIMEOUT},
+        parameters={"SYS_DIV": 1, "CLKS_PER_BIT": CLKS_PER_BIT, "RX_TIMEOUT": RX_TIMEOUT},
         build_args=["--public-flat-rw", "-Wno-fatal", "-Wno-WIDTHEXPAND", "-Wno-UNUSEDSIGNAL",
                     f'-DKWS_MEM_DIR="{ROOT}/rtl/gen/"'],
     )

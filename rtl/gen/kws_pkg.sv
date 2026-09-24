@@ -19,6 +19,8 @@ package kws_pkg;
   localparam int          LAYER_WBASE[N_LAYERS] = '{0, 160, 196, 452, 488, 744, 780, 1036, 1072};
 
   // For reference only (e.g. testbench printouts): "silence", "unknown", "yes", "no", "up", "down", "left", "right", "on", "off", "stop", "go"
+  // What the 7-segment display shows for each class, 8 characters, left-aligned.
+  localparam logic [63:0] CLASS_TEXT [N_CLASSES] = '{"SILENCE ", "UNKNOWN ", "YES     ", "NO      ", "UP      ", "DOWN    ", "LEFT    ", "RIGHT   ", "ON      ", "OFF     ", "STOP    ", "GO      "};
 
   // Mic path (python/kws/mic_model.py)
   localparam int CIC_R       = 25;

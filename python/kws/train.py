@@ -11,7 +11,7 @@ import torch
 from torch import nn
 
 from .config import CKPT_DIR, CLASSES
-from .data import Split
+from .data import make_splits, spec_augment
 from .features import LogMel
 from .model import DSCNN
 
@@ -49,13 +49,18 @@ def main():
     p.add_argument("--gain-db", type=float, default=10.0, help="random speech gain range (+-dB)")
     p.add_argument("--lr", type=float, default=3e-3)
     p.add_argument("--out", default="dscnn_float.pt")
+    p.add_argument("--data", default="real", choices=["real", "tts", "tts+real"])
+    p.add_argument("--extra-frac", type=float, default=0.2,
+                   help="TTS recipes: unknown and silence clips per epoch, relative to keywords")
+    p.add_argument("--realism", action="store_true",
+                   help="pitch/tempo, mic EQ, reverb and SpecAugment augmentation")
     args = p.parse_args()
 
     device = pick_device()
     torch.manual_seed(0)
-    train = Split("train", device, gain_db=args.gain_db)
-    val = Split("val", device)
-    test = Split("test", device)
+    train, val, test = make_splits(args.data, device, gain_db=args.gain_db, realism=args.realism,
+                                   extra_frac=args.extra_frac)
+    aug_gen = torch.Generator().manual_seed(1)
     print(f"device={device} train={len(train)} val={len(val)} test={len(test)}")
 
     frontend = LogMel().to(device)
@@ -74,7 +79,10 @@ def main():
         model.train()
         t0, total_loss, n = time.time(), 0.0, 0
         for x, y in train.batches(args.batch_size):
-            loss = loss_fn(model(frontend(x)), y)
+            f = frontend(x)
+            if args.realism:
+                f = spec_augment(f, aug_gen)
+            loss = loss_fn(model(f), y)
             opt.zero_grad()
             loss.backward()
             opt.step()
@@ -93,7 +101,7 @@ def main():
     model.load_state_dict(ckpt["model"])
     model.eval()
     acc, confusion = evaluate(lambda x: model(frontend(x)), test, args.batch_size)
-    print(f"\nbest val {best:.4f}  test {acc:.4f}")
+    print(f"\nbest val {best:.4f}  test (real speech) {acc:.4f}")
     print_confusion(confusion)
 
 

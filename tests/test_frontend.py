@@ -3,6 +3,7 @@
     uv run pytest tests/test_frontend.py
 """
 
+import os
 from pathlib import Path
 
 import numpy as np
@@ -13,7 +14,7 @@ from cocotb.triggers import ClockCycles, RisingEdge
 
 ROOT = Path(__file__).resolve().parents[1]
 SAMPLE_PERIOD = 64  # clocks per PCM sample here (6250 on the board); a frame needs ~18k
-N_CLIPS = 3
+N_CLIPS = int(os.environ.get("KWS_FE_CLIPS", "3"))
 
 
 @cocotb.test()
@@ -82,3 +83,28 @@ def test_frontend():
     )
     runner.test(hdl_toplevel="audio_frontend", test_module="test_frontend",
                 test_dir=Path(__file__).parent, build_dir=build_dir)
+
+
+def test_frontend_gates():
+    """The same test on the yosys gate-level netlist (build/postsynth/fe_netlist.v), with
+    yosys' Xilinx cell models."""
+    import subprocess
+
+    from cocotb_tools.runner import get_runner
+
+    datdir = subprocess.check_output(["yosys-config", "--datdir"], text=True).strip()
+    # Verilator, like the hardware, starts every register and memory bit at 0.
+    runner = get_runner("verilator")
+    build_dir = ROOT / "build" / "sim_frontend_gates"
+    runner.build(
+        sources=[f"{datdir}/xilinx/cells_sim.v", ROOT / "build/postsynth/fe_netlist.v"],
+        hdl_toplevel="audio_frontend",
+        build_dir=build_dir,
+        always=True,
+        build_args=["-Wno-fatal", "-Wno-lint", "-Wno-style", "--x-assign", "0", "--x-initial", "0",
+                    "-Wno-MULTIDRIVEN", "-Wno-COMBDLY", "--timing"],
+        timescale=("1ns", "1ps"),
+    )
+    runner.test(hdl_toplevel="audio_frontend", test_module="test_frontend",
+                test_dir=Path(__file__).parent, build_dir=build_dir,
+                extra_env={"KWS_FE_CLIPS": os.environ.get("KWS_FE_CLIPS", "1")})

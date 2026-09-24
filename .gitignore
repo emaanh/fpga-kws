@@ -1,9 +1,26 @@
+# Python
 .venv/
 __pycache__/
+*.pyc
+
+# Large or regenerated data: datasets, synthetic speech, trained checkpoints
 data/
 checkpoints/
+
+# Personal voice recordings (never pushed)
+recordings/
+
+# Build and simulation outputs
+build/
+*.vcd
+*.fst
+results.xml
+*.result.xml
+
+# Vivado
 *.jou
 *.log
 .Xil/
-build/
-*.result.xml
+
+# OS
+.DS_Store

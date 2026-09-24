@@ -34,6 +34,7 @@ module kws_engine
   output logic               done,        // one-cycle pulse; outputs below are then valid
   output logic [3:0]         class_idx,
   output logic signed [31:0] margin,      // top logit minus the runner-up
+  output logic [7:0]         dbg_feat_or, // debug: OR of all feature bytes the stem layer read
   output logic signed [31:0] logits [N_CLASSES]
 );
   localparam int ACT_AW  = $clog2(ACT_WORDS);
@@ -205,6 +206,13 @@ module kws_engine
   always_comb begin
     for (int i = 0; i < LANES; i++)
       acc_next[i] = (s4_first ? bias_rnd[i] : acc[i]) + 32'(s4_prod[i]);
+  end
+
+  logic [7:0] feat_or;
+  always_ff @(posedge clk) begin
+    if (state == S_IDLE && start) feat_or <= '0;
+    else if (s2_valid && kind == L_STEM) feat_or <= feat_or | feat_rdata;
+    if (state == S_DONE) dbg_feat_or <= feat_or;
   end
 
   always_ff @(posedge clk) begin
