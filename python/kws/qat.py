@@ -27,7 +27,7 @@ def main():
     p.add_argument("--lr", type=float, default=5e-4)
     p.add_argument("--float-ckpt", default="dscnn_float.pt")
     p.add_argument("--out", default="dscnn_int8.pt")
-    p.add_argument("--data", default="real", choices=["real", "tts", "tts+real"])
+    p.add_argument("--data", default="real", choices=["real", "tts", "tts+real", "tts+mine", "combined"])
     p.add_argument("--extra-frac", type=float, default=0.2,
                    help="TTS recipes: unknown and silence clips per epoch, relative to keywords")
     p.add_argument("--realism", action="store_true")

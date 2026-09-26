@@ -4,6 +4,7 @@
 #
 #   scripts/build_bitstream.sh            # build
 #   scripts/build_bitstream.sh program    # build, then load onto the board over JTAG
+#   KWS_GEN=rtl/gen_names KWS_BIT_OUT=build/bit_names scripts/build_bitstream.sh   # another model
 #
 # OPENXC7 points at the toolchain directory (nextpnr-xilinx, prjxray, chipdb, venv).
 set -euo pipefail
@@ -12,11 +13,12 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OPENXC7="${OPENXC7:-$HOME/tools/openxc7}"
 PART=xc7a100tcsg324-1
 DB="$OPENXC7/nextpnr-xilinx/xilinx/external/prjxray-db/artix7"
-OUT="$ROOT/build/bit"
+GEN="$ROOT/${KWS_GEN:-rtl/gen}"         # generated package + ROMs (kws.export)
+OUT="$ROOT/${KWS_BIT_OUT:-build/bit}"
 mkdir -p "$OUT"
 
 SOURCES=(
-  "$ROOT/rtl/gen/kws_pkg.sv"
+  "$GEN/kws_pkg.sv"
   "$ROOT/rtl/sdp_ram.sv"
   "$ROOT/rtl/kws_engine.sv"
   "$ROOT/rtl/uart_rx.sv"
@@ -33,7 +35,7 @@ SOURCES=(
 step() { echo "==> $1"; }
 
 step "sv2v"
-sv2v -DSYNTHESIS -DKWS_MEM_DIR="\"$ROOT/rtl/gen/\"" "${SOURCES[@]}" > "$OUT/kws_top.v"
+sv2v -DSYNTHESIS -DKWS_MEM_DIR="\"$GEN/\"" "${SOURCES[@]}" > "$OUT/kws_top.v"
 
 step "yosys (log: build/bit/yosys.log)"
 yosys -q -l "$OUT/yosys.log" -p "
@@ -53,7 +55,7 @@ for seed in $SEEDS; do
     --json "$OUT/kws_top.json" \
     --fasm "$OUT/seed$seed/kws_top.fasm" \
     --report "$OUT/seed$seed/report.json" \
-    --freq 50 --seed "$seed" \
+    --freq 10 --seed "$seed" \
     --log "$OUT/seed$seed/nextpnr.log" -q > /dev/null 2>&1 &
 done
 wait
@@ -85,7 +87,7 @@ step "xc7frames2bit"
   --part_file "$DB/$PART/part.yaml" --part_name "$PART" \
   --frm_file "$OUT/kws_top.frames" --output_file "$OUT/kws_top.bit"
 
-echo "Bitstream: build/bit/kws_top.bit (seed $best, timing margin $best_margin)"
+echo "Bitstream: ${OUT#$ROOT/}/kws_top.bit (seed $best, timing margin $best_margin)"
 
 if [[ "${1:-}" == "program" ]]; then
   step "openFPGALoader"

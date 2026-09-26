@@ -17,7 +17,7 @@ import numpy as np
 import serial
 import torch
 
-from .config import CKPT_DIR, CLASSES, HOP
+from .config import CKPT_DIR, CLASSES, HOP, MODEL_INT8
 from .data import CACHE_DIR
 from .debug_live import parse_packets
 from .fixed_frontend import features_fixed
@@ -70,7 +70,7 @@ def main():
     if not packets:
         raise SystemExit("no debug packets: is the board in live mode (SW15 up, SW14 down)?")
     # The board's frames started before the stream, so its frame grid is offset: try all.
-    params = torch.load(CKPT_DIR / "dscnn_int8.pt")
+    params = torch.load(CKPT_DIR / MODEL_INT8)
     rows = [tuple(pk["row"]) for pk in packets]
     best = (-1, 0, None)
     for k in range(HOP):
@@ -82,8 +82,8 @@ def main():
     ref_rows = {tuple(r) for r in ref.tolist()}
     names = [CLASSES[pk["cls"]].strip("_")[:5] for pk in packets]
     dets = [CLASSES[pk["cls"]].strip("_") for pk in packets if pk["det"]]
-    print(f"{len(packets)} inferences; copied bytes {sorted({pk['copy_n'] for pk in packets})}, "
-          f"copy OR {sorted({hex(pk['copy_or']) for pk in packets})}")
+    print(f"{len(packets)} results; OR of the features the engine read "
+          f"{sorted({hex(pk['feat_or']) for pk in packets})}")
     print(f"board feature rows matching a Python frame exactly: {exact}/{len(packets)} "
           f"(frame offset {offset})")
     if exact < len(packets):

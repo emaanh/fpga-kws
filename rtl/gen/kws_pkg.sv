@@ -3,14 +3,15 @@ package kws_pkg;
   localparam int LANES      = 16;
   localparam int CHANNELS   = 64;
   localparam int GROUPS     = 4;
-  localparam int IN_H       = 49;
+  localparam int IN_H       = 49;   // window, in frames
   localparam int IN_W       = 40;
-  localparam int OUT_H      = 25;
-  localparam int OUT_W      = 20;
+  localparam int OUT_W      = 20;   // pixels per row after the stem
+  localparam int STEM_KH    = 10;   // stem kernel height: frames per stem row
+  localparam int POOL_ROWS  = 12;   // rows of the last layer in a window
+  localparam int FULL_STEPS = 20;   // stem rows in a window: steps until a whole window
   localparam int N_LAYERS   = 9;
-  localparam int N_CLASSES  = 12;
+  localparam int N_CLASSES  = 14;
   localparam int WROM_WORDS = 1328;
-  localparam int ACT_WORDS  = OUT_H * OUT_W * GROUPS;
 
   typedef enum logic [1:0] {L_STEM, L_DW, L_PW} layer_kind_t;
 
@@ -18,9 +19,9 @@ package kws_pkg;
   localparam layer_kind_t LAYER_KIND [N_LAYERS] = '{L_STEM, L_DW, L_PW, L_DW, L_PW, L_DW, L_PW, L_DW, L_PW};
   localparam int          LAYER_WBASE[N_LAYERS] = '{0, 160, 196, 452, 488, 744, 780, 1036, 1072};
 
-  // For reference only (e.g. testbench printouts): "silence", "unknown", "yes", "no", "up", "down", "left", "right", "on", "off", "stop", "go"
+  // For reference only (e.g. testbench printouts): "silence", "unknown", "yes", "no", "up", "down", "left", "right", "on", "off", "stop", "go", "emaan", "heidari"
   // What the 7-segment display shows for each class, 8 characters, left-aligned.
-  localparam logic [63:0] CLASS_TEXT [N_CLASSES] = '{"SILENCE ", "UNKNOWN ", "YES     ", "NO      ", "UP      ", "DOWN    ", "LEFT    ", "RIGHT   ", "ON      ", "OFF     ", "STOP    ", "GO      "};
+  localparam logic [63:0] CLASS_TEXT [N_CLASSES] = '{"SILENCE ", "UNKNOWN ", "YES     ", "NO      ", "UP      ", "DOWN    ", "LEFT    ", "RIGHT   ", "ON      ", "OFF     ", "STOP    ", "GO      ", "ENNAAN  ", "HEIDARI "};
 
   // Mic path (python/kws/mic_model.py)
   localparam int CIC_R       = 25;
@@ -36,4 +37,9 @@ package kws_pkg;
   localparam int MEL_ENTRIES = 466;
   localparam longint FE_EPS  = 274878;
   localparam int FE_OFFSET   = 1888;  // Q6, model-specific
+
+  // Live mode: a result every 2 frames (40 ms); a keyword must win LIVE_N_CONSEC in a row,
+  // each by at least LIVE_MARGIN (SW5:4 = 00; see kws_top).
+  localparam int LIVE_N_CONSEC = 6;
+  localparam int LIVE_MARGIN   = 196608;
 endpackage

@@ -3,9 +3,10 @@
     uv run python -m kws.demo            # then open http://127.0.0.1:8777
 
 Mac mic (16 kHz) -> gain in 6 dB steps (like SW3:0) -> fixed-point frontend (bit-exact to
-audio_frontend.sv) -> int8 engine (bit-exact to kws_engine.sv) every 5 frames on the last 49
--> the decision rule of kws_live.sv (margin + 3 wins in a row, 1 s hold). The board's PDM mic
-path is not modelled here (in simulation it costs ~0.4% accuracy).
+audio_frontend.sv) -> int8 model (bit-exact to kws_engine.sv) every 2 frames on the last 49,
+which is what the streaming engine computes -> the decision rule of kws_live.sv (margin +
+N_CONSEC wins in a row, 1 s hold). The board's PDM mic path is not modelled here (in
+simulation it costs ~0.4% accuracy).
 """
 
 import argparse
@@ -21,23 +22,23 @@ import numpy as np
 import sounddevice as sd
 import torch
 
-from .config import CKPT_DIR, CLASSES, HOP
+from .config import CKPT_DIR, CLASSES, HOP, MARGIN, MODEL_INT8, N_CONSEC
 from .fixed_frontend import features_fixed
-from .quant import int_forward
+from .quant import int_forward, is_streaming
 
 SR = 16_000
 WIN = 512
 IN_H = 49
-INFER_EVERY = 5
-N_CONSEC = 3
 HOLD_S = 1.0
-MARGINS = {"00": 1 << 18, "01": 1 << 17, "10": 1 << 19, "11": 0}  # SW5:4 on the board
+MARGINS = {"00": MARGIN, "01": MARGIN - MARGIN // 4, "10": MARGIN + MARGIN // 4, "11": 0}  # SW5:4
 HTML = Path(__file__).with_name("demo.html")
 
 
 class Pipeline:
-    def __init__(self, model="dscnn_int8.pt"):
+    def __init__(self, model=MODEL_INT8):
         self.params = torch.load(CKPT_DIR / model)
+        # Streaming models: a result every 2 frames, windows starting on even frames.
+        self.every = 2 if is_streaming(self.params) else 5
         qat = torch.load(CKPT_DIR / model.replace("int8", "qat"), map_location="cpu")
         # Integer logits are float logits times a fixed scale (500 * 2^k).
         self.logit_scale = float(np.median(self.params["fc_b"].numpy() / qat["fc_bias"].numpy()))
@@ -57,7 +58,7 @@ class Pipeline:
 
     def state(self):
         return {"type": "state", "gain_db": self.gain_db, "margin_sel": self.margin_sel,
-                "classes": [c.strip("_") for c in CLASSES]}
+                "classes": [c.strip("_") for c in CLASSES], "n_consec": N_CONSEC}
 
     # -------------------------------------------------------------------------------------
     def run(self):
@@ -95,7 +96,7 @@ class Pipeline:
                                     "terminal app has microphone access (System Settings > "
                                     "Privacy & Security > Microphone)."})
 
-                if n_frames % INFER_EVERY or n_frames < IN_H:
+                if n_frames < IN_H or (n_frames - IN_H) % self.every:
                     continue
                 t0 = time.perf_counter()
                 window = np.stack(list(frames)[-IN_H:])
@@ -183,7 +184,7 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--port", type=int, default=8777)
     p.add_argument("--device", help="input device name or index (default: system default)")
-    p.add_argument("--model", default="dscnn_int8.pt", help="integer model in checkpoints/")
+    p.add_argument("--model", default=MODEL_INT8, help="integer model in checkpoints/")
     p.add_argument("--file", help="play a 16 kHz WAV (e.g. a board recording) instead of the mic")
     p.add_argument("--loop", action="store_true", help="with --file: repeat forever")
     args = p.parse_args()

@@ -1,8 +1,8 @@
 """cocotb end-to-end test of live mode: PDM bits -> kws_top -> classes and detections.
 
 Plays a few seconds of audio (quiet noise, then test-set keywords) as PDM bits into the
-mic pins and checks every inference's class and every detection against the bit-exact
-Python model: mic_model -> fixed_frontend -> int_forward -> decision rule.
+mic pins and checks every result's class and margin and every detection against the
+bit-exact Python model: mic_model -> fixed_frontend -> stream_forward -> decision rule.
 
     uv run pytest tests/test_live.py
 """
@@ -15,16 +15,14 @@ import cocotb
 from cocotb.clock import Clock
 from cocotb.triggers import ClockCycles, RisingEdge
 
-from test_top import TOP_SOURCES
+from test_top import TOP_SOURCES, gen_dir
 
 ROOT = Path(__file__).resolve().parents[1]
 BUILD = ROOT / "build" / "sim_live"
-PDM_PERIOD = 8       # clocks per PDM bit here (25 on the board, at 50 MHz)
+PDM_PERIOD = 8       # clocks per PDM bit here (5 on the board, at 10 MHz)
 GAIN = 6
 LEVEL = 2**-6        # speech level at the mic, relative to full scale
 WORDS = ["yes", "stop", "go", "left"]
-INFER_EVERY, IN_H = 5, 49
-N_CONSEC, MIN_MARGIN = 3, 262_144  # kws_live.sv defaults
 
 
 def make_stream():
@@ -47,23 +45,19 @@ def make_stream():
 def expected_results(bits):
     import torch
 
-    from kws.config import CKPT_DIR
+    from kws.config import CKPT_DIR, MARGIN, MODEL_INT8, N_CONSEC
+    from kws.eval_stream import detect
     from kws.fixed_frontend import features_fixed
     from kws.mic_model import mic_pcm
-    from kws.quant import int_forward
+    from kws.quant import stream_forward
 
-    params = torch.load(CKPT_DIR / "dscnn_int8.pt")
+    params = torch.load(CKPT_DIR / MODEL_INT8)
     q = features_fixed(mic_pcm(bits, GAIN), params["mean"], params["f_in"])
-    windows = [q[k - IN_H : k] for k in range(INFER_EVERY * ((IN_H + INFER_EVERY - 1) // INFER_EVERY),
-                                            len(q) + 1, INFER_EVERY)]
-    x = torch.from_numpy(np.stack(windows).astype(np.int64)).unsqueeze(1)
-    from kws.eval_stream import detect
-
-    logits = int_forward(params, x)
+    logits = stream_forward(params, q)
     top2 = logits.topk(2, dim=1).values
     classes = logits.argmax(1).tolist()
     margins = (top2[:, 0] - top2[:, 1]).tolist()
-    detections = [c for _, c in detect(classes, margins, N_CONSEC, MIN_MARGIN)]
+    detections = [c for _, c in detect(classes, margins, N_CONSEC, MARGIN)]
     return classes, margins, detections
 
 
@@ -94,8 +88,10 @@ async def test_live_mode(dut):
     async def watch_engine():
         while True:
             await RisingEdge(dut.u_top.u_engine.done)
-            classes.append(int(dut.u_top.u_engine.class_idx.value))
-            margins.append(dut.u_top.u_engine.margin.value.to_signed())
+            await RisingEdge(dut.clk)
+            if int(dut.u_top.u_engine.full.value):  # results before a whole window are ignored
+                classes.append(int(dut.u_top.u_engine.class_idx.value))
+                margins.append(dut.u_top.u_engine.margin.value.to_signed())
 
     async def watch_detect():
         while True:
@@ -106,13 +102,13 @@ async def test_live_mode(dut):
     cocotb.start_soon(watch_engine())
     cocotb.start_soon(watch_detect())
     await RisingEdge(dut.done_playing)
-    await ClockCycles(dut.clk, 800_000)  # let the last inference finish
+    await ClockCycles(dut.clk, 100_000)  # let the last step finish
 
     names = lambda cs: [CLASSES[c].strip("_") for c in cs]  # noqa: E731
-    dut._log.info(f"inferences: {names(classes)}")
+    dut._log.info(f"results: {names(classes)}")
     dut._log.info(f"detections: {names(detections)} (played {WORDS})")
     n = min(len(classes), len(classes_ref))
-    assert n >= len(classes_ref) - 1, f"only {len(classes)} inferences, expected {len(classes_ref)}"
+    assert n >= len(classes_ref) - 1, f"only {len(classes)} results, expected {len(classes_ref)}"
     assert classes[:n] == classes_ref[:n], f"classes differ:\n{classes}\n{classes_ref}"
     assert margins[:n] == margins_ref[:n], f"margins differ:\n{margins}\n{margins_ref}"
     assert detections == detections_ref[: len(detections)] and \
@@ -134,7 +130,7 @@ def test_live():
         parameters={"BITS_FILE": f'"{BUILD / "pdm_bits.hex"}"', "N_WORDS": n_words,
                     "PDM_PERIOD": PDM_PERIOD},
         build_args=["--public-flat-rw", "-Wno-fatal", "-Wno-WIDTHEXPAND", "-Wno-UNUSEDSIGNAL",
-                    "-O3", f'-DKWS_MEM_DIR="{ROOT}/rtl/gen/"'],
+                    "-O3", f'-DKWS_MEM_DIR="{gen_dir()}/"'],
     )
     runner.test(hdl_toplevel="tb_live", test_module="test_live",
                 test_dir=Path(__file__).parent, build_dir=BUILD)

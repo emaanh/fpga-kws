@@ -292,6 +292,8 @@ def make_splits(kind: str, device, gain_db=0.0, seed=0, realism=False, extra_fra
     only ever used for the final test.
     """
     test = Split("test", device)
+    if kind == "combined":
+        return _combined_splits(device, gain_db, seed, realism, test)
     if kind == "real":
         return (Split("train", device, gain_db=gain_db, seed=seed, realism=realism),
                 Split("val", device), test)
@@ -303,6 +305,26 @@ def make_splits(kind: str, device, gain_db=0.0, seed=0, realism=False, extra_fra
         pick = np.random.default_rng(seed).choice(real_unk, min(n, len(real_unk)), replace=False)
         audio = np.concatenate([audio, d["audio"][pick]])
         labels = np.concatenate([labels, d["labels"][pick]])
+    elif kind == "tts+mine":
+        # Your own recordings (kws.record_ui --mac), repeated so that each name weighs about
+        # as much as its synthetic examples. Real speech sits on both sides (names and
+        # talking), so "sounds like my mic" cannot become a shortcut for "is a name".
+        from .my_clips import clips_from_folder
+        from .record_ui import MAC_DIR
+
+        mine, mine_labels, _ = clips_from_folder(MAC_DIR)
+        if len(mine) == 0:
+            raise SystemExit(f"no recordings in {MAC_DIR}")
+        n_syn = max(1, int((labels >= 2).sum()) // max(1, len(KEYWORDS)))
+        reps = np.ones(len(mine), int)
+        for c in np.unique(mine_labels):
+            k = (mine_labels == c).sum()
+            reps[mine_labels == c] = max(1, round(0.7 * n_syn / k)) if c >= 2 else max(1, round(0.3 * n_syn / k))
+        audio = np.concatenate([audio, np.repeat(mine, reps, axis=0)])
+        labels = np.concatenate([labels, np.repeat(mine_labels, reps)])
+        print(f"added {len(mine)} of your clips (x{sorted(set(reps.tolist()))} repeats): "
+              + ", ".join(f"{CLASSES[c].strip('_')} {(mine_labels == c).sum()}"
+                          for c in np.unique(mine_labels)))
     elif kind != "tts":
         raise ValueError(kind)
     # Each epoch: every keyword clip, plus unknowns and silences at `extra_frac` of that count
@@ -311,6 +333,60 @@ def make_splits(kind: str, device, gain_db=0.0, seed=0, realism=False, extra_fra
                   extra_frac=extra_frac, realism=realism)
     val = Split("val_tts", device, arrays=tts_arrays("val", seed))
     return train, val, test
+
+
+def _combined_splits(device, gain_db, seed, realism, test):
+    """The 10 Speech Commands words plus custom words (e.g. names) in one model.
+
+    Every source covers several classes, so no source can stand in for a class:
+      Speech Commands  the default keywords, real non-keywords        (real strangers)
+      clips.npz        synthetic default keywords and non-keywords    (Kokoro)
+      names.npz        synthetic custom words and non-keywords        (Kokoro)
+      your recordings  custom words, your talking and silence         (your Mac mic)
+    Non-keywords from the synthetic and your-recording sources are repeated so that the
+    "unknown" class is not mostly real Speech Commands audio.
+    """
+    from .my_clips import clips_from_folder
+    from .record_ui import MAC_DIR
+
+    rng = np.random.default_rng(seed)
+    d = np.load(CACHE_DIR / "train.npz")
+    lut = np.array([CLASSES.index(c) if c in CLASSES else UNKNOWN_IDX for c in DEFAULT_CLASSES])
+    parts = [(d["audio"], lut[d["labels"]], "speech commands")]
+    for f in ["clips.npz", "names.npz"]:
+        a, l = tts_arrays("train", seed, clips=f)
+        parts.append((a, l, f))
+    mine, mine_l, _ = clips_from_folder(MAC_DIR)
+    parts.append((mine, mine_l, "your recordings"))
+
+    # Per-class target: about as many examples per custom word as a Speech Commands word has.
+    n_word = int(np.median(np.bincount(parts[0][1], minlength=len(CLASSES))[2:][
+        np.bincount(parts[0][1], minlength=len(CLASSES))[2:] > 0]))
+    n_sc_unk = int((parts[0][1] == UNKNOWN_IDX).sum())
+    audio, labels = [], []
+    for a, l, name in parts:
+        reps = np.ones(len(l), int)
+        for c in np.unique(l):
+            k = int((l == c).sum())
+            if name == "speech commands":
+                continue
+            if c >= 2 and CLASSES[c] not in DEFAULT_CLASSES:       # custom words
+                share = 0.6 if name == "names.npz" else 0.4      # synthetic vs your voice
+                reps[l == c] = max(1, round(share * n_word / k))
+            elif c == UNKNOWN_IDX:                               # non-keywords
+                share = 0.25 if name != "your recordings" else 0.1
+                reps[l == c] = max(1, round(share * n_sc_unk / k))
+            elif c == SILENCE_IDX:
+                reps[l == c] = max(1, round(2000 / k))
+        audio.append(np.repeat(a, reps, axis=0))
+        labels.append(np.repeat(l, reps))
+        counts = np.bincount(np.repeat(l, reps), minlength=len(CLASSES))
+        print(f"  {name:<16} " + ", ".join(f"{CLASSES[c].strip('_')} {counts[c]}"
+                                             for c in range(len(CLASSES)) if counts[c]))
+    audio, labels = np.concatenate(audio), np.concatenate(labels)
+    train = Split("train_combined", device, gain_db=gain_db, seed=seed, arrays=(audio, labels),
+                  extra_frac=0.15, realism=realism)
+    return train, Split("val", device), test
 
 
 if __name__ == "__main__":

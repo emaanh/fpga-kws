@@ -1,9 +1,10 @@
 """Streaming evaluation of the live decision rule, on the bit-exact pipeline (without PDM).
 
 Builds a long stream of test-set clips (keywords, non-keyword words, silence) over light
-background noise, runs the fixed-point frontend and the integer model every INFER_EVERY
-frames like kws_live.sv, and applies the rule "a keyword that wins N inferences in a row is
-detected" for several N. Reports hit rate, wrong-word rate and false alarms per hour.
+background noise, runs the fixed-point frontend and the integer model like the board (a
+result every 2 frames for a streaming model), and applies the rule "a keyword that wins N
+results in a row is detected" for several N. Reports hit rate, wrong-word rate, false
+alarms per hour and how long after the word ends a detection comes.
 
     uv run python -m kws.eval_stream
 """
@@ -13,12 +14,11 @@ import argparse
 import numpy as np
 import torch
 
-from .config import CKPT_DIR, CLASSES, HOP
+from .config import CKPT_DIR, CLASSES, HOP, MODEL_INT8, WIN
 from .data import CACHE_DIR
 from .fixed_frontend import features_fixed
-from .quant import int_forward
+from .quant import logits_over_time
 
-INFER_EVERY, IN_H = 5, 49
 SR = 16_000
 
 
@@ -42,13 +42,17 @@ def main():
     p.add_argument("--n-unknown", type=int, default=300)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--split", default="val", help="tune on val; report on test")
-    p.add_argument("--n-consec", type=int, nargs="*", default=[3, 4])
+    p.add_argument("--model", default=MODEL_INT8)
+    p.add_argument("--every", type=int, default=5, help="frames per inference (full-window models)")
+    p.add_argument("--n-consec", type=int, nargs="*", default=[3, 4, 5, 6])
     p.add_argument("--margins", type=float, nargs="*", default=[0, 0.1, 0.2, 0.3, 0.4],
                    help="as fractions of the logit scale (median top-1 logit)")
+    p.add_argument("--abs-margins", type=int, nargs="*", default=[],
+                   help="margins in integer logit units, like the board's (overrides --margins)")
     args = p.parse_args()
     rng = np.random.default_rng(args.seed)
 
-    params = torch.load(CKPT_DIR / "dscnn_int8.pt")
+    params = torch.load(CKPT_DIR / args.model)
     d = np.load(CACHE_DIR / f"{args.split}.npz")
     audio, labels = d["audio"].astype(np.float64) / 32768, d["labels"]
     noise = np.load(CACHE_DIR / "noise.npy")
@@ -71,24 +75,22 @@ def main():
 
     q = np.concatenate([features_fixed(pcm[i : i + SR * 60 + 512], params["mean"], params["f_in"])
                         [: (SR * 60) // HOP] for i in range(0, len(pcm) - 512, SR * 60)])
-    ends = np.arange(INFER_EVERY * 10, len(q) + 1, INFER_EVERY)  # inference after frame k
-    x = torch.from_numpy(np.stack([q[k - IN_H : k] for k in ends]).astype(np.int64)).unsqueeze(1)
-    logits = torch.cat([int_forward(params, b) for b in x.split(512)])
+    ends, logits = logits_over_time(params, q, args.every)  # last frame of each window
     top2 = logits.topk(2, dim=1).values
     classes = logits.argmax(1).tolist()
     margins = (top2[:, 0] - top2[:, 1]).tolist()
     scale = float(top2[:, 0].abs().median())
-    t_inf = ends * HOP + 512 - HOP  # sample index at which each inference's window ends
+    t_inf = ends * HOP + WIN  # sample index at which each result's window ends
 
     hours = len(stream) / SR / 3600
-    print(f"{len(order)} clips ({args.n_keywords} keywords), {len(stream) / SR / 60:.1f} min, "
-          f"{len(classes)} inferences")
+    print(f"{args.model}: {len(order)} clips ({args.n_keywords} keywords), "
+          f"{len(stream) / SR / 60:.1f} min, {len(classes)} results")
     print(f"logit scale (median top-1): {scale:.0f}")
     for n in args.n_consec:
-        for frac in args.margins:
+        for frac in ([m / scale for m in args.abs_margins] or args.margins):
             dets = [(t_inf[i], c) for i, c in detect(classes, margins, n, frac * scale)]
             hit = wrong = false = 0
-            matched = set()
+            matched, delays = set(), []
             for td, c in dets:
                 # A detection belongs to a clip if it fires while the clip is in the window.
                 ev = next((j for j, (s, e, _) in enumerate(events) if s <= td <= e + SR), None)
@@ -97,10 +99,13 @@ def main():
                 elif events[ev][2] == c and ev not in matched:
                     hit += 1
                     matched.add(ev)
+                    delays.append((td - events[ev][1]) / SR)  # after the clip ends
                 elif events[ev][2] != c:
                     wrong += 1
             print(f"N={n} margin {frac:.2f} ({int(frac * scale)}): hit {hit / args.n_keywords:.3f}, "
-                  f"wrong word {wrong / args.n_keywords:.3f}, false alarms {false / hours:.0f}/hour")
+                  f"wrong word {wrong / args.n_keywords:.3f}, false alarms {false / hours:.0f}/hour, "
+                  f"median detection {np.median(delays) * 1000 if delays else float('nan'):+.0f} ms "
+                  f"after the clip ends")
 
 
 if __name__ == "__main__":

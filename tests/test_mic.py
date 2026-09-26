@@ -62,16 +62,18 @@ async def test_mic_chain(dut):
 def test_mic():
     from cocotb_tools.runner import get_runner
 
+    from kws.config import GEN_DIR
+
     runner = get_runner("verilator")
     build_dir = ROOT / "build" / "sim_mic"
     runner.build(
-        sources=[ROOT / f for f in ["rtl/gen/kws_pkg.sv", "rtl/sdp_ram.sv", "rtl/cic_decim.sv",
+        sources=[GEN_DIR / "kws_pkg.sv"] + [ROOT / f for f in ["rtl/sdp_ram.sv", "rtl/cic_decim.sv",
                                     "rtl/mic_fir.sv", "tests/hdl/mic_chain.sv"]],
         hdl_toplevel="mic_chain",
         build_dir=build_dir,
         always=True,
         build_args=["-Wno-fatal", "-Wno-WIDTHEXPAND", "-Wno-UNUSEDSIGNAL",
-                    f'-DKWS_MEM_DIR="{ROOT}/rtl/gen/"'],
+                    f'-DKWS_MEM_DIR="{GEN_DIR}/"'],
     )
     runner.test(hdl_toplevel="mic_chain", test_module="test_mic",
                 test_dir=Path(__file__).parent, build_dir=build_dir)

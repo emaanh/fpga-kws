@@ -57,10 +57,10 @@
 </head>
 <body>
 <div class="wrap">
-  <h1>Board recorder</h1>
-  <p class="sub">Test clips of your voice through the Nexys A7 microphone. They are only used to measure the model, never to train it.</p>
+  <h1 id="title">Board recorder</h1>
+  <p class="sub" id="subtitle">Test clips of your voice through the Nexys A7 microphone. They are only used to measure the model, never to train it.</p>
 
-  <div class="panel">
+  <div class="panel" id="switches-panel">
     <h2>Board switches</h2>
     <div class="switches">
       <span class="sw up">SW15 up (live)</span><span class="sw up">SW14 up (record)</span>
@@ -72,7 +72,7 @@
     <h2>Microphone level</h2>
     <div class="meter"><div class="target"></div><div class="fill" id="fill"></div></div>
     <div class="meter-row"><span>-60 dBFS</span><span id="db">waiting for audio…</span><span>0</span></div>
-    <div id="nosignal">No audio from the board. Check that SW15 and SW14 are up.</div>
+    <div id="nosignal">No audio. Check that SW15 and SW14 are up.</div>
   </div>
 
   <div class="panel">
@@ -151,6 +151,12 @@ es.onmessage = m => {
     $("db").textContent = `${e.dbfs.toFixed(1)} dBFS`;
   } else if (e.type === "state") {
     labels = e.labels; recording = e.recording;
+    if (e.source === "mac") {
+      $("title").textContent = "Mac microphone recorder";
+      $("subtitle").textContent = `Training clips of your voice through this Mac's microphone, saved to ${e.folder}/. The board-mic takes stay the test set.`;
+      $("switches-panel").style.display = "none";
+      $("nosignal").textContent = "No audio from the Mac microphone. Check microphone access in System Settings.";
+    }
     renderButtons(); renderFiles(e.files); runStage();
     if (e.saved) { $("msg").className = "msg ok"; $("msg").textContent = `Saved ${e.saved}`; }
     if (e.error) { $("msg").className = "msg err"; $("msg").textContent = e.error; }

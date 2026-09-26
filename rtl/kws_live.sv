@@ -1,16 +1,15 @@
-// Live keyword spotting: PDM mic -> PCM -> features -> engine, with a simple decision rule.
+// Live keyword spotting: PDM mic -> PCM -> features -> streaming engine -> decision.
 //
 //   mic      pdm_mic -> cic_decim -> mic_fir (DC block, gain)       16 kHz int16 PCM
-//   features audio_frontend, one row of N_MELS every HOP samples     into a 64-frame ring
-//   infer    every INFER_EVERY frames (once IN_H frames exist), copy the newest IN_H rows
-//            into the engine's feature RAM and start it
-//   decide   an inference is a "win" for keyword c when c is the argmax and its logit
-//            beats the runner-up by at least min_margin; N_CONSEC wins in a row for the
-//            same keyword is a detection. It is shown for HOLD_CYCLES and not re-reported
-//            while shown. (Tuned with python -m kws.eval_stream; retune after retraining.)
+//   features audio_frontend, one row of N_MELS every HOP samples, straight to the engine,
+//            which computes a new result every second frame (40 ms)
+//   decide   a result is a "win" for keyword c when c is the argmax and its logit beats the
+//            runner-up by at least min_margin; N_CONSEC wins in a row for the same keyword
+//            is a detection. It is shown for HOLD_CYCLES and not re-reported while shown.
+//            (Tuned with python -m kws.eval_stream; retune after retraining.)
 //
-// The engine is shared with the UART feature mode, so this module drives its feature write
-// port and start through the top level's mux, and only while `enable` is set.
+// The engine is shared with the UART feature mode, so this module drives its feature input
+// through the top level's mux, and only uses its results while `enable` is set.
 
 `ifndef KWS_MEM_DIR
 `define KWS_MEM_DIR ""
@@ -21,16 +20,16 @@ module kws_live
 #(
   parameter string MEM_DIR     = `KWS_MEM_DIR,
   parameter int    PDM_PERIOD  = 25,           // PDM clock = clk / PDM_PERIOD
-  parameter int    INFER_EVERY = 5,            // frames between inferences (5 = 100 ms)
+  parameter int    PDM_DELAY   = 0,            // see pdm_mic
   parameter int    HOLD_CYCLES = 100_000_000,  // how long a detection stays shown
-  parameter int    N_CONSEC    = 3
+  parameter int    N_CONSEC    = LIVE_N_CONSEC  // from the exported model (kws_pkg)
 ) (
   input  logic               clk,
   input  logic               rst,
   input  logic               enable,
   input  logic [3:0]         gain,
   input  logic               sample_fall,
-  input  logic signed [31:0] min_margin,    // 2^18 by default (see kws_top)
+  input  logic signed [31:0] min_margin,    // LIVE_MARGIN by default (see kws_top)
   // PCM from the host instead of the mic (testing)
   input  logic               ext_en,
   input  logic               ext_valid,
@@ -43,13 +42,14 @@ module kws_live
   output logic               pcm_valid,
   output logic signed [15:0] pcm,
   output logic [3:0]         level,         // position of the leading one of the recent peak
-  // engine
+  // features for the engine: N_MELS (band, value) pairs per frame, then frame_end
   output logic               feat_we,
-  output logic [10:0]        feat_waddr,
+  output logic [5:0]         feat_band,
   output logic [7:0]         feat_wdata,
-  output logic               eng_start,
-  input  logic               eng_busy,
+  output logic               frame_end,
+  // engine results
   input  logic               eng_done,
+  input  logic               eng_full,
   input  logic [3:0]         eng_class,
   input  logic signed [31:0] eng_margin,
   // result
@@ -72,7 +72,7 @@ module kws_live
   logic [5:0]         f_band;
   logic signed [7:0]  f_q;
 
-  pdm_mic #(.PERIOD(PDM_PERIOD)) u_pdm (
+  pdm_mic #(.PERIOD(PDM_PERIOD), .DELAY(PDM_DELAY)) u_pdm (
     .clk, .rst, .sample_fall, .m_clk, .m_lrsel, .m_data, .bit_valid, .bit_data);
   cic_decim u_cic (
     .clk, .rst, .in_valid(bit_valid), .in_bit(bit_data), .out_valid(c_valid), .out_data(c_data));
@@ -125,93 +125,10 @@ module kws_live
     end
   end
 
-  // ---------------------------------------------------------------------------------------
-  // Feature ring: 64 frames x N_MELS
-  // ---------------------------------------------------------------------------------------
-  localparam int RING = 64;
-
-  logic [5:0]  wr_slot, newest;
-  logic [11:0] ring_raddr;
-  logic [7:0]  ring_rdata;
-  logic [15:0] frames_total;
-  logic [3:0]  since_infer;
-  logic        want_infer;
-
-  // LUT RAM: as a (RAMB36) block RAM it read back zeros on the board with the open flow.
-  // Ring addresses are slot * 40 + band, written as shifts: as a multiply, yosys put it on
-  // a DSP48 (with the add), which computed wrong addresses on the board.
-  function automatic logic [11:0] ring_addr(input logic [5:0] slot, input logic [5:0] band);
-    return {1'b0, slot, 5'b0} + {3'b0, slot, 3'b0} + 12'(band);
-  endfunction
-
-  sdp_ram #(.WIDTH(8), .DEPTH(RING * N_MELS), .STYLE("distributed")) u_ring (
-    .clk, .we(f_valid), .waddr(ring_addr(wr_slot, f_band)), .wdata(f_q),
-    .raddr(ring_raddr), .rdata(ring_rdata));
-
-  always_ff @(posedge clk) begin
-    want_infer <= 1'b0;
-    if (frame_done) begin
-      newest  <= wr_slot;
-      wr_slot <= wr_slot + 1'b1;
-      if (frames_total != '1) frames_total <= frames_total + 1'b1;
-      if (since_infer == 4'(INFER_EVERY - 1)) begin
-        since_infer <= '0;
-        want_infer  <= frames_total + 1 >= IN_H;
-      end else begin
-        since_infer <= since_infer + 1'b1;
-      end
-    end
-    if (rst) begin
-      wr_slot      <= '0;
-      frames_total <= '0;
-      since_infer  <= '0;
-    end
-  end
-
-  // ---------------------------------------------------------------------------------------
-  // Copy the newest IN_H frames (oldest first) into the engine, then start it
-  // ---------------------------------------------------------------------------------------
-  logic        copying, c1_valid, c2_valid;
-  logic [5:0]  ch;          // row 0..IN_H-1
-  logic [5:0]  cw;          // band 0..N_MELS-1
-  logic [10:0] dst, c1_dst, c2_dst;
-  logic [5:0]  src_slot;
-
-  // The ring is LUT RAM: register its read address (C1), data arrives in C2.
-  assign src_slot = newest - 6'(IN_H - 1) + ch;
-  always_ff @(posedge clk) ring_raddr <= ring_addr(src_slot, cw);
-
-  always_ff @(posedge clk) begin
-    eng_start <= 1'b0;
-    c1_valid  <= copying;
-    c1_dst    <= dst;
-    c2_valid  <= c1_valid;
-    c2_dst    <= c1_dst;
-
-    if (want_infer && enable && !eng_busy && !copying && !c1_valid && !c2_valid) begin
-      copying <= 1'b1;
-      {ch, cw, dst} <= '0;
-    end else if (copying) begin
-      dst <= dst + 1'b1;
-      if (cw == 6'(N_MELS - 1)) begin
-        cw <= '0;
-        if (ch == 6'(IN_H - 1)) copying <= 1'b0;
-        else ch <= ch + 1'b1;
-      end else cw <= cw + 1'b1;
-    end
-
-    if (c2_valid && !c1_valid) eng_start <= 1'b1;  // the last word is written this cycle
-
-    if (rst) begin
-      copying  <= 1'b0;
-      c1_valid <= 1'b0;
-      c2_valid <= 1'b0;
-    end
-  end
-
-  assign feat_we    = c2_valid;
-  assign feat_waddr = c2_dst;
-  assign feat_wdata = ring_rdata;
+  assign feat_we    = f_valid;
+  assign feat_band  = f_band;
+  assign feat_wdata = f_q;
+  assign frame_end  = frame_done;
 
   // ---------------------------------------------------------------------------------------
   // Decision
@@ -228,8 +145,9 @@ module kws_live
 
   always_ff @(posedge clk) begin
     margin_q <= min_margin;  // a switch setting: keep it off the paths
-    // Step 1, the cycle after an inference: is it a confident keyword?
-    decide    <= eng_done && enable;
+    // Step 1, the cycle after a result: is it a confident keyword? (Results before the
+    // engine has a whole window, just after a restart, are ignored.)
+    decide    <= eng_done && eng_full && enable;
     win_class <= eng_margin >= margin_q ? eng_class : 4'd0;  // not confident: silence
 
     // Step 2: count wins in a row, detect

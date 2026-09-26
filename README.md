@@ -1,5 +1,7 @@
 # Keyword Spotting on FPGA
 
+## [video demo](https://youtu.be/mECDMYMU4tU)
+
 ## motivation
 A year ago I implemented inference of a 4-layer MLP on an FPGA for doing MNIST digit classification. I wanted to see what other ML models could be run this hardware. In this project, I'm doing keyword spotting. I'm now taking this a step further to design and implement language models for FPGAs in [Alloy](https://github.com/emaanh/Alloy)
 
@@ -29,22 +31,29 @@ coming soon I need to borrow Josh's FPGA again lmao
 | Float frontend, float model | 95.81% |
 | Float frontend, int8 model  | 95.83% |
 
-Live detection on a 20 minute stream of held-out keywords, other words and silence
-(`kws.eval_stream`): about 91% of keywords detected, 5% reported as the wrong word, and
-about 100 false alarms per hour from non-keyword speech.
+The streaming 12-word model (int8, bit-exact on the FPGA): 91.9% on the Speech Commands
+test set. On a 20 minute stream of held-out keywords, other words and silence
+(`kws.eval_stream`): 84% of keywords detected, 1% reported as the wrong word, and about
+21 false alarms per hour from non-keyword speech.
 
-Resources used on FPGA: about 10k LUTs (8%), 32 DSP48 (13%) and 20% of block RAM. One
-inference takes 665k cycles (6.65 ms at 100 MHz) and runs every 100 ms.
+Resources used on FPGA: about 11.7k LUTs (9%), 30 DSP48 (12%) and 21% of block RAM, at a
+10 MHz system clock (timing closes at 84 MHz). The engine produces a result every 40 ms
+in 28k cycles (2.8 ms): 0.43M MACs per result, 25x fewer than re-running the full window
+(10.6M MACs, 665k cycles), so it is idle about 93% of the time.
 
 ## how it works
 
 - **Model:** DS-CNN-S, 23k parameters: a 10x4 conv,
-  four depthwise-separable blocks with 64 channels, global average pool and a 12-way FC.
-  Trained with time shift, background noise and +-10 dB level
-  augmentation, then quantization-aware trained to int8.
-- **Engine** (`rtl/kws_engine.sv`): 16 parallel MACs, one per output channel, running the
-  layers one after another with ping-pong activation buffers in block RAM. BatchNorm,
-  input normalization and rounding are folded into the weights and biases ahead of time.
+  four depthwise-separable blocks with 64 channels, global average pool and a 14-way FC.
+  No padding along time, so it can stream (below). Trained with time shift, background
+  noise and +-10 dB level augmentation, then quantization-aware trained to int8.
+- **Engine** (`rtl/kws_engine.sv`): streaming. Every second frame (40 ms) it computes one
+  new row of each layer and keeps the older rows in small ring buffers, instead of
+  re-running the whole 1 s window: 0.43M MACs per result instead of 10.6M, 28k cycles.
+  16 parallel MACs, one per output channel. The pool sums the last 12 rows of the last layer.
+  BatchNorm, input normalization and rounding are folded into the weights and biases.
+- **Power:** the design runs at 10 MHz (the engine is busy about 7% of the time), and
+  every memory reads only when its data is used, so idle logic does not toggle.
 - **Frontend** (`rtl/audio_frontend.sv`): a sequential radix-2 FFT and a sparse mel filter
   bank, about 18k cycles per 20 ms frame.
 
@@ -80,9 +89,9 @@ scripts/build_bitstream.sh program   # build and load it over JTAG
 ```
 
 The flow is sv2v, yosys, nextpnr-xilinx and prjxray. The script tries 8 placement seeds in
-parallel and keeps the fastest. The best seeds reach about 104 MHz (nextpnr's estimate)
-against the 100 MHz target, so the margin is thin; `scripts/vivado_synth.tcl` builds the
-same design in Vivado for a proper timing sign-off.
+parallel and keeps the fastest. The design runs at 10 MHz (the 100 MHz board clock divided
+by 10), far below what it can reach. `scripts/vivado_synth.tcl` builds the same design in
+Vivado as a cross-check.
 
 nextpnr-xilinx and prjxray are not in Homebrew. The script expects them under `$OPENXC7`
 (default `~/tools/openxc7`):
@@ -117,7 +126,7 @@ cmake --build prjxray/build --target xc7frames2bit
 | SW15 | 0: UART feature mode, 1: live microphone mode |
 | SW14 | live mode: stream the mic's PCM over UART for `kws.record` |
 | SW13 | sample the mic on the falling clock edge instead of the rising edge |
-| SW5:4 | detection margin: 00 = 2^18 (default), 01 = 2^17 (more sensitive), 10 = 2^19, 11 = off |
+| SW5:4 | detection margin: 00 = default, 01 = x0.75 (more sensitive), 10 = x1.25 (stricter), 11 = off |
 | SW3:0 | mic gain in 6 dB steps (0 to 12); 6 (+36 dB) is the starting point |
 
 | LED | Meaning |

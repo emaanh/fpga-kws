@@ -3,12 +3,15 @@
 // SW15 = 0: UART feature mode (8N1 at 1 Mbaud)
 //   host -> board  'I' followed by IN_H*IN_W int8 feature bytes (row-major, h*IN_W + w)
 //   board -> host  'R', class index, then the N_CLASSES int32 logits, little-endian
+//   The engine streams: it restarts at 'I' and gets the window frame by frame, like live
+//   mode, and the reply is its first result that covers the whole window.
 //   A frame that stalls for RX_TIMEOUT cycles is dropped, so the host can always resync.
 //   LEDs 11:0 one-hot class. The display shows the last keyword (silence/unknown show nothing).
 //
 // SW15 = 1: live mode, from the on-board PDM microphone (kws_live.sv)
 //   SW3:0 mic gain in 6 dB steps (0..12), SW13 samples the mic on the falling clock edge.
-//   SW5:4 detection margin: 00 = 2^18 (default), 01 = 2^17, 10 = 2^19, 11 = off.
+//   SW5:4 detection margin: 00 = LIVE_MARGIN (kws_pkg), 01 = x0.75 (more sensitive),
+//   10 = x1.25 (stricter), 11 = off.
 //   The display shows a detected word for 2 s. LEDs 11:0 are a mic level meter.
 //   SW12 takes the audio from the host instead of the mic, 3 bytes per sample as below
 //   (python -m kws.inject), for testing the whole live path on the board.
@@ -17,8 +20,7 @@
 //   With SW14 off it sends a debug packet per inference instead (python -m kws.debug_live):
 //     'K', class, margin (int32, little-endian), {detected, 3'b0, mic level},
 //     frontend: OR of windowed magnitudes (4 B), OR of powers (7 B), features per frame,
-//     copy into the engine: bytes written (2 B), their OR, OR of what the engine read,
-//     then the last 40 features
+//     OR of the features the engine read, then the last 40 features
 //
 // Both modes: LED 13 live mode, 14 engine busy, 15 heartbeat.
 
@@ -30,13 +32,18 @@ module kws_top
   import kws_pkg::*;
 #(
   parameter string MEM_DIR      = `KWS_MEM_DIR,
-  // The design runs at the 100 MHz board clock divided by SYS_DIV (50 MHz): the open-source
-  // flow could not place it reliably at 100 MHz. The constants below are in system clocks.
-  parameter int    SYS_DIV      = 2,
-  parameter int    CLKS_PER_BIT = 50,          // 1 Mbaud
-  parameter int    RX_TIMEOUT   = 2_500_000,   // 50 ms
-  parameter int    PDM_PERIOD   = 25,          // 2 MHz mic clock
-  parameter int    HOLD_CYCLES  = 100_000_000  // 2 s
+  // The design runs at the 100 MHz board clock divided by SYS_DIV: 10 MHz, the slowest
+  // clock that keeps the 2 MHz mic clock and 1 Mbaud UART whole multiples (the streaming
+  // engine needs under 1 MHz). Dynamic power scales with it. The constants below are in
+  // system clocks.
+  parameter int    SYS_DIV      = 10,
+  parameter int    SYS_HZ       = 100_000_000 / SYS_DIV,
+  parameter int    CLKS_PER_BIT = SYS_HZ / 1_000_000,  // 1 Mbaud
+  parameter int    RX_TIMEOUT   = SYS_HZ / 20,         // 50 ms
+  parameter int    PDM_PERIOD   = SYS_HZ / 2_000_000,  // 2 MHz mic clock
+  parameter int    PDM_DELAY    = PDM_PERIOD < 10 ? 2 : 0,  // sample the mic pin at the edge
+  parameter int    HOLD_CYCLES  = 2 * SYS_HZ,          // 2 s
+  parameter int    SCAN_BITS    = $clog2(SYS_HZ) - 11  // 7-segment: ~150 Hz per digit
 ) (
   input  logic        clk,      // 100 MHz board clock
   input  logic        rst_n,    // CPU_RESETN button
@@ -105,9 +112,9 @@ module kws_top
   // ---------------------------------------------------------------------------------------
   // Engine, shared by both modes
   // ---------------------------------------------------------------------------------------
-  logic               eng_start, eng_busy, eng_done;
-  logic               eng_we;
-  logic [10:0]        eng_waddr;
+  logic               eng_restart, eng_busy, eng_done, eng_full;
+  logic               eng_we, eng_frame_end;
+  logic [5:0]         eng_band;
   logic [7:0]         eng_wdata;
   logic [3:0]         class_idx;
   logic signed [31:0] margin;
@@ -115,31 +122,16 @@ module kws_top
   logic signed [31:0] logits [N_CLASSES];
 
   kws_engine #(.MEM_DIR(MEM_DIR)) u_engine (
-    .clk(sys_clk), .rst,
-    .feat_we(eng_we), .feat_waddr(eng_waddr), .feat_wdata(eng_wdata),
-    .start(eng_start), .busy(eng_busy), .done(eng_done),
+    .clk(sys_clk), .rst, .restart(eng_restart),
+    .feat_we(eng_we), .feat_band(eng_band), .feat_wdata(eng_wdata), .frame_end(eng_frame_end),
+    .busy(eng_busy), .done(eng_done), .full(eng_full),
     .class_idx, .margin, .dbg_feat_or(eng_feat_or), .logits);
-
-  // Debug: feature bytes written into the engine before each start, and their OR.
-  logic [10:0] copy_n, copy_n_q;
-  logic [7:0]  copy_or, copy_or_q;
-  always_ff @(posedge sys_clk) begin
-    if (eng_start) begin
-      copy_n_q  <= copy_n;
-      copy_or_q <= copy_or;
-      copy_n    <= '0;
-      copy_or   <= '0;
-    end else if (eng_we) begin
-      copy_n  <= copy_n + 1'b1;
-      copy_or <= copy_or | eng_wdata;
-    end
-  end
 
   // ---------------------------------------------------------------------------------------
   // Live mode
   // ---------------------------------------------------------------------------------------
-  logic               live_we, live_start, detect, showing;
-  logic [10:0]        live_waddr;
+  logic               live_we, live_frame_end, detect, showing;
+  logic [5:0]         live_band;
   logic [7:0]         live_wdata;
   logic [3:0]         show_class, level;
   logic               pcm_valid;
@@ -152,9 +144,9 @@ module kws_top
   logic signed [31:0] min_margin;
   always_comb begin
     unique case (sw_sync[5:4])
-      2'b00: min_margin = 32'sd1 <<< 18;
-      2'b01: min_margin = 32'sd1 <<< 17;
-      2'b10: min_margin = 32'sd1 <<< 19;
+      2'b00: min_margin = 32'(LIVE_MARGIN);
+      2'b01: min_margin = 32'(LIVE_MARGIN - LIVE_MARGIN / 4);
+      2'b10: min_margin = 32'(LIVE_MARGIN + LIVE_MARGIN / 4);
       default: min_margin = '0;
     endcase
   end
@@ -182,13 +174,14 @@ module kws_top
     if (rst) ext_have <= '0;
   end
 
-  kws_live #(.MEM_DIR(MEM_DIR), .PDM_PERIOD(PDM_PERIOD), .HOLD_CYCLES(HOLD_CYCLES)) u_live (
+  kws_live #(.MEM_DIR(MEM_DIR), .PDM_PERIOD(PDM_PERIOD), .PDM_DELAY(PDM_DELAY),
+             .HOLD_CYCLES(HOLD_CYCLES)) u_live (
     .clk(sys_clk), .rst, .enable(live), .gain(sw_sync[3:0]), .sample_fall(sw_sync[13]), .min_margin,
     .ext_en(sw_sync[12]), .ext_valid, .ext_pcm,
     .m_clk, .m_lrsel, .m_data,
     .pcm_valid, .pcm, .level,
-    .feat_we(live_we), .feat_waddr(live_waddr), .feat_wdata(live_wdata),
-    .eng_start(live_start), .eng_busy, .eng_done, .eng_class(class_idx), .eng_margin(margin),
+    .feat_we(live_we), .feat_band(live_band), .feat_wdata(live_wdata), .frame_end(live_frame_end),
+    .eng_done, .eng_full, .eng_class(class_idx), .eng_margin(margin),
     .dbg_win_or(fe_win_or), .dbg_pow_or(fe_pow_or), .dbg_nfeat(fe_nfeat), .dbg_row(fe_row),
     .detect, .showing, .show_class);
 
@@ -198,8 +191,9 @@ module kws_top
   typedef enum logic [2:0] {P_IDLE, P_RECV, P_RUN, P_PREP, P_SEND} pstate_t;
 
   pstate_t                         state;
-  logic                            uart_start;
+  logic                            uart_restart;
   logic [10:0]                     rx_count;
+  logic [5:0]                      rx_band;
   logic [$clog2(RX_TIMEOUT+1)-1:0] idle_cycles;
   logic [5:0]                      tx_idx;
   logic                            have_result;
@@ -209,13 +203,17 @@ module kws_top
 
   assign uart_rx_valid = rx_valid && !live;
 
-  // Registered mux into the engine: `live` fans out widely. Delaying start and the feature
-  // writes by the same cycle keeps start after the last write.
+  // Registered mux into the engine: `live` fans out widely. The engine restarts when live
+  // mode turns on and at each UART request.
+  logic live_q;
   always_ff @(posedge sys_clk) begin
-    eng_we    <= live ? live_we    : state == P_RECV && uart_rx_valid;
-    eng_waddr <= live ? live_waddr : rx_count;
-    eng_wdata <= live ? live_wdata : rx_data;
-    eng_start <= live ? live_start : uart_start;
+    live_q        <= live;
+    eng_restart   <= live ? !live_q : uart_restart;
+    eng_we        <= live ? live_we : state == P_RECV && uart_rx_valid;
+    eng_band      <= live ? live_band : rx_band;
+    eng_wdata     <= live ? live_wdata : rx_data;
+    eng_frame_end <= live ? live_frame_end
+                          : state == P_RECV && uart_rx_valid && rx_band == 6'(N_MELS - 1);
   end
 
   function automatic logic [7:0] reply_byte(input logic [5:0] i);
@@ -236,7 +234,7 @@ module kws_top
 
   // Live debug stream: one packet per inference (see the header), loaded whole and shifted
   // out a byte at a time (a byte mux here was the critical path).
-  localparam int DBG_LEN = 23 + N_MELS;
+  localparam int DBG_LEN = 20 + N_MELS;
   logic [8*DBG_LEN-1:0] dbg_pkt;
   logic [5:0]           dbg_left;
   logic [3:0]           dbg_wait;   // let the detection decision (a few cycles late) land
@@ -249,26 +247,26 @@ module kws_top
   logic [1:0] tx_gap;
 
   always_ff @(posedge sys_clk) begin
-    uart_start <= 1'b0;
-    tx_start   <= 1'b0;
+    uart_restart <= 1'b0;
+    tx_start     <= 1'b0;
     tx_ok      <= !tx_busy && tx_gap == 0;
     if (tx_gap != 0) tx_gap <= tx_gap - 1'b1;
 
     unique case (state)
       P_IDLE: if (uart_rx_valid && rx_data == "I") begin
-        rx_count    <= '0;
-        idle_cycles <= '0;
-        state       <= P_RECV;
+        uart_restart <= 1'b1;
+        rx_count     <= '0;
+        rx_band      <= '0;
+        idle_cycles  <= '0;
+        state        <= P_RECV;
       end
 
       P_RECV: begin
         if (uart_rx_valid) begin
           rx_count    <= rx_count + 1'b1;
+          rx_band     <= rx_band == 6'(N_MELS - 1) ? '0 : rx_band + 1'b1;
           idle_cycles <= '0;
-          if (rx_count == 11'(N_FEAT - 1)) begin
-            uart_start <= 1'b1;
-            state      <= P_RUN;
-          end
+          if (rx_count == 11'(N_FEAT - 1)) state <= P_RUN;
         end else if (idle_cycles == ($bits(idle_cycles))'(RX_TIMEOUT) || live) begin
           state <= P_IDLE;
         end else begin
@@ -276,7 +274,7 @@ module kws_top
         end
       end
 
-      P_RUN: if (eng_done) begin
+      P_RUN: if (eng_done && eng_full) begin  // the step that completes the window
         have_result <= 1'b1;
         if (class_idx >= 4'd2) begin  // hold the last keyword; silence/unknown change nothing
           have_word <= 1'b1;
@@ -319,7 +317,7 @@ module kws_top
 
     if (live && !record && state == P_IDLE) begin
       if (eng_done) begin
-        dbg_pkt  <= {row_bits, eng_feat_or, copy_or_q, 16'(copy_n_q), 8'(fe_nfeat), 56'(fe_pow_or),
+        dbg_pkt  <= {row_bits, eng_feat_or, 8'(fe_nfeat), 56'(fe_pow_or),
                      fe_win_or, {4'b0, level}, margin, 8'(class_idx), 8'("K")};
         dbg_left <= 6'(DBG_LEN);
         dbg_wait <= '1;
@@ -351,7 +349,7 @@ module kws_top
   // ---------------------------------------------------------------------------------------
   // Display
   // ---------------------------------------------------------------------------------------
-  logic [26:0] heartbeat;
+  logic [$clog2(SYS_HZ)-1:0] heartbeat;  // LED 15 toggles about every 0.8 s
   always_ff @(posedge sys_clk) heartbeat <= heartbeat + 1'b1;
 
   logic [11:0] meter;
@@ -363,9 +361,9 @@ module kws_top
   assign led[12]   = live && showing;
   assign led[13]   = live;
   assign led[14]   = eng_busy;
-  assign led[15]   = heartbeat[26];
+  assign led[15]   = heartbeat[$clog2(SYS_HZ)-1];
 
-  seg7_word u_seg (
+  seg7_word #(.SCAN_BITS(SCAN_BITS)) u_seg (
     .clk(sys_clk),
     .show(live ? showing : have_word),
     .class_idx(live ? show_class : last_word),

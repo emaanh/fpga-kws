@@ -3,8 +3,14 @@
 //
 // The ADMP421 with L/R select low drives data for the rising clock edge; `sample_fall`
 // switches to sampling at the falling edge instead, in case the board needs it.
+//
+// The data pin goes through a 2-flop synchronizer, so the bit taken when the counter says
+// "edge" is the pin 2 clocks before the edge. DELAY takes it 0..2 clocks later instead:
+// at a slow system clock (10 MHz: 2 clocks = 200 ns of a 500 ns mic period), DELAY = 2
+// samples the pin at the edge itself.
 module pdm_mic #(
-  parameter int PERIOD = 25   // clocks per mic clock period (low for PERIOD/2, then high)
+  parameter int PERIOD = 25,  // clocks per mic clock period (low for PERIOD/2, then high)
+  parameter int DELAY  = 0
 ) (
   input  logic clk,
   input  logic rst,
@@ -15,7 +21,9 @@ module pdm_mic #(
   output logic bit_valid,
   output logic bit_data   // 1 = +1, 0 = -1
 );
-  localparam int LOW = PERIOD / 2;
+  localparam int LOW  = PERIOD / 2;
+  localparam int RISE = (LOW - 1 + DELAY) % PERIOD;     // cnt to sample at, per edge
+  localparam int FALL = (PERIOD - 1 + DELAY) % PERIOD;
 
   logic [$clog2(PERIOD)-1:0] cnt;
   logic [1:0]                data_sync;
@@ -27,8 +35,8 @@ module pdm_mic #(
     bit_valid <= 1'b0;
     cnt       <= cnt == ($clog2(PERIOD))'(PERIOD - 1) ? '0 : cnt + 1'b1;
     m_clk     <= cnt >= ($clog2(PERIOD))'(LOW - 1) && cnt != ($clog2(PERIOD))'(PERIOD - 1);
-    // Sample just before the edge that is about to be made.
-    if (cnt == (sample_fall ? ($clog2(PERIOD))'(PERIOD - 1) : ($clog2(PERIOD))'(LOW - 1))) begin
+    // Sample just before the edge that is about to be made (plus DELAY).
+    if (cnt == (sample_fall ? ($clog2(PERIOD))'(FALL) : ($clog2(PERIOD))'(RISE))) begin
       bit_valid <= 1'b1;
       bit_data  <= data_sync[1];
     end

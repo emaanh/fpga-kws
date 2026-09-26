@@ -48,7 +48,7 @@ module audio_frontend
   logic [15:0] pcm_rdata;
 
   sdp_ram #(.WIDTH(16), .DEPTH(1024)) u_pcm (
-    .clk, .we(pcm_valid), .waddr(pcm_wptr), .wdata(pcm), .raddr(pcm_raddr), .rdata(pcm_rdata));
+    .clk, .we(pcm_valid), .waddr(pcm_wptr), .wdata(pcm), .re(state == F_WIN), .raddr(pcm_raddr), .rdata(pcm_rdata));
 
   always_ff @(posedge clk) begin
     trigger <= 1'b0;
@@ -87,21 +87,23 @@ module audio_frontend
   logic [6:0]  lut_rdata;
 
   sdp_ram #(.WIDTH(16), .DEPTH(FFT_N), .INIT({MEM_DIR, "fe_hann.hex"}), .STYLE("block")) u_hann (
-    .clk, .we(1'b0), .waddr('0), .wdata('0), .raddr(hann_raddr), .rdata(hann_rdata));
+    .clk, .we(1'b0), .waddr('0), .wdata('0), .re(state == F_WIN), .raddr(hann_raddr), .rdata(hann_rdata));
   // The FFT and power RAMs are LUT RAM: written RAMB36 block RAMs misbehaved on the board
   // with the open-source flow (the RAMB18-sized RAMs are fine).
   sdp_ram #(.WIDTH(50), .DEPTH(FFT_N), .STYLE("distributed")) u_fft (
-    .clk, .we(fft_we), .waddr(fft_waddr), .wdata(fft_wdata), .raddr(fft_raddr), .rdata(fft_rdata));
+    .clk, .we(fft_we), .waddr(fft_waddr), .wdata(fft_wdata),
+    .re(state == F_FFT || state == F_POW), .raddr(fft_raddr), .rdata(fft_rdata));
   sdp_ram #(.WIDTH(36), .DEPTH(FFT_N / 2), .INIT({MEM_DIR, "fe_twiddle.hex"}), .STYLE("block")) u_tw (
-    .clk, .we(1'b0), .waddr('0), .wdata('0), .raddr(tw_raddr), .rdata(tw_rdata));
+    .clk, .we(1'b0), .waddr('0), .wdata('0), .re(state == F_FFT), .raddr(tw_raddr), .rdata(tw_rdata));
   sdp_ram #(.WIDTH(49), .DEPTH(FFT_N), .STYLE("distributed")) u_pow (
-    .clk, .we(pow_we), .waddr(pow_waddr), .wdata(pow_wdata), .raddr(pow_raddr), .rdata(pow_rdata));
+    .clk, .we(pow_we), .waddr(pow_waddr), .wdata(pow_wdata),
+    .re(state == F_MEL), .raddr(pow_raddr), .rdata(pow_rdata));
   sdp_ram #(.WIDTH(18), .DEPTH(MEL_ENTRIES), .INIT({MEM_DIR, "fe_mel.hex"}), .STYLE("block")) u_mel (
-    .clk, .we(1'b0), .waddr('0), .wdata('0), .raddr(mel_raddr), .rdata(mel_rdata));
+    .clk, .we(1'b0), .waddr('0), .wdata('0), .re(state == F_MEL), .raddr(mel_raddr), .rdata(mel_rdata));
   sdp_ram #(.WIDTH(1), .DEPTH(MEL_ENTRIES), .INIT({MEM_DIR, "fe_mel_last.hex"})) u_mel_last (
-    .clk, .we(1'b0), .waddr('0), .wdata('0), .raddr(mel_raddr), .rdata(mel_last));
+    .clk, .we(1'b0), .waddr('0), .wdata('0), .re(state == F_MEL), .raddr(mel_raddr), .rdata(mel_last));
   sdp_ram #(.WIDTH(7), .DEPTH(256), .INIT({MEM_DIR, "fe_log2.hex"}), .STYLE("block")) u_log2 (
-    .clk, .we(1'b0), .waddr('0), .wdata('0), .raddr(lut_raddr), .rdata(lut_rdata));
+    .clk, .we(1'b0), .waddr('0), .wdata('0), .re(state == F_MEL), .raddr(lut_raddr), .rdata(lut_rdata));
 
   function automatic logic [8:0] bitrev9(input logic [8:0] x);
     for (int i = 0; i < 9; i++) bitrev9[i] = x[8 - i];

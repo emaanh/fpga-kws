@@ -138,7 +138,7 @@
 
     <section class="panel">
       <h2>Detections</h2>
-      <ul class="log" id="log"><li class="empty" style="background:none;padding:0">Say "yes", "no", "up", "down", "left", "right", "on", "off", "stop" or "go".</li></ul>
+      <ul class="log" id="log"><li class="empty" style="background:none;padding:0">Say "yes", "no", "up", "down", "left", "right", "on", "off", "stop", "go", "Emaan" or "Heidari".</li></ul>
     </section>
   </div>
 
@@ -160,14 +160,14 @@
         </div>
       </div>
       <div class="stats">
-        <span>wins in a row <b class="mono" id="hits">0</b> / 3</span>
+        <span>wins in a row <b class="mono" id="hits">0</b> / <span id="nconsec">6</span></span>
         <span>inference <b class="mono" id="ims">-</b> ms on the Mac</span>
         <span>inferences <b class="mono" id="count">0</b></span>
       </div>
     </section>
 
     <section class="panel">
-      <h2>Last 4 seconds of inferences (every 100 ms)</h2>
+      <h2>Last 40 results (one every 40 ms)</h2>
       <div class="timeline" id="timeline"></div>
       <div class="note">Blue: a keyword is on top. Green: it also beats the runner-up by the margin (a "win"). Outlined: detection.</div>
     </section>
@@ -224,7 +224,7 @@ const gainEl = document.getElementById("gain");
   b.dataset.v = db; b.onclick = () => post({ gain_db: db }); gainEl.appendChild(b);
 });
 const marginEl = document.getElementById("margin");
-[["01", "2^17 sensitive"], ["00", "2^18 default"], ["10", "2^19 strict"], ["11", "off"]].forEach(([v, t]) => {
+[["01", "x0.75 sensitive"], ["00", "default"], ["10", "x1.25 strict"], ["11", "off"]].forEach(([v, t]) => {
   const b = document.createElement("button"); b.textContent = t; b.dataset.v = v;
   b.onclick = () => post({ margin_sel: v }); marginEl.appendChild(b);
 });
@@ -328,6 +328,7 @@ function connect() {
     else if (e.type === "state") {
       markOn(gainEl, e.gain_db); markOn(marginEl, e.margin_sel);
       if (e.classes) { CLASSES = e.classes; buildBars(); }
+      if (e.n_consec) document.getElementById("nconsec").textContent = e.n_consec;
     }
     else if (e.type === "warn") { warnEl.textContent = e.msg; warnEl.style.display = "block"; }
   };

@@ -2,10 +2,11 @@
 
 Board: SW15 (live) and SW14 (record) up, gain on SW3:0. Then:
 
-    uv run python -m kws.record_ui        # http://127.0.0.1:8778
+    uv run python -m kws.record_ui              # board mic -> recordings/names_test/ (test set)
+    uv run python -m kws.record_ui --mac        # Mac mic -> recordings/names_train_mac/ (training)
 
 Shows a live level meter, prompts you ("Say: Emaan") at a steady pace while recording, and
-saves each take as recordings/names_test/<label>_<n>.wav (16 kHz int16) for evaluation.
+saves each take as <folder>/<label>_<n>.wav (16 kHz int16).
 """
 
 import argparse
@@ -26,7 +27,8 @@ from .host import BAUD, find_port
 from .record import decode
 
 SR = 16_000
-OUT_DIR = ROOT / "recordings" / "names_test"
+BOARD_DIR = ROOT / "recordings" / "names_test"      # board mic: test set
+MAC_DIR = ROOT / "recordings" / "names_train_mac"   # Mac mic: training data
 HTML = Path(__file__).with_name("record_ui.html")
 LABELS = {
     "emaan": {"title": "Emaan", "prompt": "Emaan", "seconds": 30, "every": 2.5},
@@ -37,8 +39,10 @@ LABELS = {
 
 
 class Recorder:
-    def __init__(self, port):
+    def __init__(self, port, out_dir, source):
         self.port = port
+        self.out_dir = out_dir
+        self.source = source
         self.clients: list[queue.Queue] = []
         self.lock = threading.Lock()
         self.take: list[np.ndarray] | None = None  # samples collected for the current take
@@ -54,7 +58,7 @@ class Recorder:
 
     def files(self):
         out = []
-        for f in sorted(OUT_DIR.glob("*.wav")):
+        for f in sorted(self.out_dir.glob("*.wav")):
             sr, x = wavfile.read(f)
             out.append({"name": f.name, "label": f.name.rsplit("_", 1)[0],
                         "seconds": round(len(x) / sr, 1)})
@@ -62,7 +66,30 @@ class Recorder:
 
     def state(self):
         return {"type": "state", "files": self.files(), "labels": LABELS,
-                "recording": self.take_info}
+                "recording": self.take_info, "source": self.source,
+                "folder": str(self.out_dir.relative_to(ROOT))}
+
+    def add_samples(self, samples, pending):
+        """New PCM: keep it for the current take and update the level meter."""
+        self.last_rx = time.time()
+        if self.take is not None:
+            self.take.append(samples)
+        pending = np.concatenate([pending, samples])
+        if len(pending) >= SR // 10:  # a level update every 100 ms
+            peak = int(np.abs(pending.astype(np.int32)).max())
+            self.broadcast({"type": "level", "dbfs": round(20 * np.log10(max(peak, 1) / 32768), 1)})
+            pending = np.zeros(0, np.int16)
+        return pending
+
+    def run_mac(self):
+        import sounddevice as sd
+
+        q: queue.Queue = queue.Queue()
+        with sd.InputStream(samplerate=SR, channels=1, dtype="int16", blocksize=320,
+                            callback=lambda d, n, t, s: q.put(d[:, 0].copy())):
+            pending = np.zeros(0, np.int16)
+            while True:
+                pending = self.add_samples(q.get(), pending)
 
     def run_serial(self):
         buf = bytearray()
@@ -73,15 +100,7 @@ class Recorder:
                 buf += ser.read(4096)
                 samples, buf = decode(buf)
                 if len(samples):
-                    self.last_rx = time.time()
-                    if self.take is not None:
-                        self.take.append(samples)
-                    pending = np.concatenate([pending, samples])
-                if len(pending) >= SR // 10:  # a level update every 100 ms
-                    peak = int(np.abs(pending.astype(np.int32)).max())
-                    self.broadcast({"type": "level",
-                                    "dbfs": round(20 * np.log10(max(peak, 1) / 32768), 1)})
-                    pending = np.zeros(0, np.int16)
+                    pending = self.add_samples(samples, pending)
                 if time.time() - self.last_rx > 1.0:
                     self.broadcast({"type": "level", "dbfs": None})
                     self.last_rx = time.time()
@@ -95,14 +114,15 @@ class Recorder:
         chunks, self.take = self.take, None
         self.take_info = None
         pcm = np.concatenate(chunks) if chunks else np.zeros(0, np.int16)
-        OUT_DIR.mkdir(parents=True, exist_ok=True)
-        n = 1 + max([int(m.group(1)) for f in OUT_DIR.glob(f"{label}_*.wav")
+        self.out_dir.mkdir(parents=True, exist_ok=True)
+        n = 1 + max([int(m.group(1)) for f in self.out_dir.glob(f"{label}_*.wav")
                      if (m := re.search(r"_(\d+)\.wav$", f.name))], default=0)
         name = f"{label}_{n}.wav"
         if len(pcm):
-            wavfile.write(OUT_DIR / name, SR, pcm)
+            wavfile.write(self.out_dir / name, SR, pcm)
+        hint = "Is SW14 up?" if self.source == "board" else "Does this app have microphone access?"
         self.broadcast({**self.state(), "saved": name if len(pcm) else None,
-                        "error": None if len(pcm) else "No audio arrived: is SW14 up?"})
+                        "error": None if len(pcm) else f"No audio arrived. {hint}"})
 
 
 def make_handler(rec: Recorder):
@@ -121,7 +141,7 @@ def make_handler(rec: Recorder):
             if self.path == "/":
                 return self.send_body(HTML.read_bytes(), "text/html; charset=utf-8")
             if self.path.startswith("/audio/"):
-                f = OUT_DIR / Path(self.path[7:]).name
+                f = rec.out_dir / Path(self.path[7:]).name
                 if f.exists():
                     return self.send_body(f.read_bytes(), "audio/wav")
                 return self.send_error(404)
@@ -155,7 +175,7 @@ def make_handler(rec: Recorder):
             if self.path == "/record" and body.get("label") in LABELS and rec.take_info is None:
                 threading.Thread(target=rec.record, args=(body["label"],), daemon=True).start()
             elif self.path == "/delete":
-                f = OUT_DIR / Path(body.get("name", "")).name
+                f = rec.out_dir / Path(body.get("name", "")).name
                 if f.exists() and f.suffix == ".wav":
                     f.unlink()
                 rec.broadcast(rec.state())
@@ -169,11 +189,18 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--port", type=int, default=8778)
     p.add_argument("--serial")
+    p.add_argument("--mac", action="store_true", help="record the Mac's microphone (training data)")
     args = p.parse_args()
-    rec = Recorder(args.serial or find_port())
-    threading.Thread(target=rec.run_serial, daemon=True).start()
+    if args.mac:
+        rec = Recorder(None, MAC_DIR, "mac")
+        threading.Thread(target=rec.run_mac, daemon=True).start()
+    else:
+        rec = Recorder(args.serial or find_port(), BOARD_DIR, "board")
+        threading.Thread(target=rec.run_serial, daemon=True).start()
     server = ThreadingHTTPServer(("127.0.0.1", args.port), make_handler(rec))
-    print(f"Recorder on {rec.port}. Open http://127.0.0.1:{args.port}  (Ctrl+C to stop)", flush=True)
+    src = "the Mac microphone" if args.mac else rec.port
+    print(f"Recording from {src} into {rec.out_dir}. Open http://127.0.0.1:{args.port}",
+          flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

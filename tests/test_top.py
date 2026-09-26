@@ -1,5 +1,8 @@
 """End-to-end cocotb test of rtl/kws_top.sv over its UART, with a fast baud rate for simulation.
 
+The board streams the window through the engine frame by frame and replies with the first
+result that covers all of it, which must equal the integer model on the window.
+
     uv run pytest tests/test_top.py
 """
 
@@ -14,8 +17,14 @@ from cocotb.triggers import ClockCycles, FallingEdge, Timer, with_timeout
 
 from test_engine import ROOT, load_reference
 
-TOP_SOURCES = [ROOT / f for f in [
-    "rtl/gen/kws_pkg.sv", "rtl/sdp_ram.sv", "rtl/kws_engine.sv", "rtl/uart_rx.sv",
+
+def gen_dir():
+    from kws.config import GEN_DIR
+    return GEN_DIR
+
+
+TOP_SOURCES = [gen_dir() / "kws_pkg.sv"] + [ROOT / f for f in [
+    "rtl/sdp_ram.sv", "rtl/kws_engine.sv", "rtl/uart_rx.sv",
     "rtl/uart_tx.sv", "rtl/seg7_word.sv", "rtl/pdm_mic.sv", "rtl/cic_decim.sv", "rtl/mic_fir.sv",
     "rtl/audio_frontend.sv", "rtl/kws_live.sv", "rtl/kws_top.sv"]]
 
@@ -64,11 +73,11 @@ async def test_uart_inference(dut):
     await ClockCycles(dut.clk, 2 * RX_TIMEOUT)
 
     for idx in np.linspace(0, len(feats) - 1, N_CLIPS).astype(int):
-        logits_ref, _, _ = reference(feats[idx])
+        logits_ref = reference(feats[idx])
         recv = cocotb.start_soon(uart_recv(dut.uart_tx, 2 + 4 * len(logits_ref)))
         await uart_send(dut.uart_rx, b"I" + feats[idx].astype(np.int8).tobytes())
         try:
-            reply = await with_timeout(recv, 10, "ms")  # inference alone is 6.65 ms
+            reply = await with_timeout(recv, 20, "ms")  # 20 steps of 28k cycles: 5.6 ms
         except Exception:
             dut._log.error(f"state={dut.state.value} rx_count={int(dut.rx_count.value)} "
                            f"engine busy={dut.eng_busy.value}")
@@ -93,7 +102,7 @@ def test_top():
         always=True,
         parameters={"SYS_DIV": 1, "CLKS_PER_BIT": CLKS_PER_BIT, "RX_TIMEOUT": RX_TIMEOUT},
         build_args=["--public-flat-rw", "-Wno-fatal", "-Wno-WIDTHEXPAND", "-Wno-UNUSEDSIGNAL",
-                    f'-DKWS_MEM_DIR="{ROOT}/rtl/gen/"'],
+                    f'-DKWS_MEM_DIR="{gen_dir()}/"'],
     )
     runner.test(hdl_toplevel="kws_top", test_module="test_top",
                 test_dir=Path(__file__).parent, build_dir=build_dir)

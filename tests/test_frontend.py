@@ -21,11 +21,11 @@ N_CLIPS = int(os.environ.get("KWS_FE_CLIPS", "3"))
 async def test_features(dut):
     import torch
 
-    from kws.config import CKPT_DIR
+    from kws.config import CKPT_DIR, MODEL_INT8
     from kws.data import CACHE_DIR
     from kws.fixed_frontend import features_fixed
 
-    params = torch.load(CKPT_DIR / "dscnn_int8.pt")
+    params = torch.load(CKPT_DIR / MODEL_INT8)
     d = np.load(CACHE_DIR / "test.npz")
     clips = d["audio"][np.linspace(0, len(d["audio"]) - 1, N_CLIPS).astype(int)]
     # One continuous stream: frames that straddle two clips are checked too.
@@ -71,15 +71,17 @@ async def test_features(dut):
 def test_frontend():
     from cocotb_tools.runner import get_runner
 
+    from kws.config import GEN_DIR
+
     runner = get_runner("verilator")
     build_dir = ROOT / "build" / "sim_frontend"
     runner.build(
-        sources=[ROOT / f for f in ["rtl/gen/kws_pkg.sv", "rtl/sdp_ram.sv", "rtl/audio_frontend.sv"]],
+        sources=[GEN_DIR / "kws_pkg.sv"] + [ROOT / f for f in ["rtl/sdp_ram.sv", "rtl/audio_frontend.sv"]],
         hdl_toplevel="audio_frontend",
         build_dir=build_dir,
         always=True,
         build_args=["-Wno-fatal", "-Wno-WIDTHEXPAND", "-Wno-UNUSEDSIGNAL",
-                    f'-DKWS_MEM_DIR="{ROOT}/rtl/gen/"'],
+                    f'-DKWS_MEM_DIR="{GEN_DIR}/"'],
     )
     runner.test(hdl_toplevel="audio_frontend", test_module="test_frontend",
                 test_dir=Path(__file__).parent, build_dir=build_dir)

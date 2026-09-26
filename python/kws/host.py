@@ -16,10 +16,9 @@ import numpy as np
 import serial
 import torch
 
-from .config import CKPT_DIR, CLASSES, ROOT
+from .config import CKPT_DIR, CLASSES, MODEL_INT8, VEC_DIR
 from .quant import int_forward
 
-VEC_DIR = ROOT / "build" / "vectors"
 BAUD = 1_000_000
 REPLY_LEN = 2 + 4 * len(CLASSES)
 
@@ -53,7 +52,7 @@ def main():
     labels = np.fromfile(VEC_DIR / "test_labels_preds.bin", np.uint8).reshape(-1, 2)[:, 0]
     idx = np.arange(len(feats)) if args.n is None else np.linspace(0, len(feats) - 1, args.n).astype(int)
 
-    params = torch.load(CKPT_DIR / "dscnn_int8.pt")
+    params = torch.load(CKPT_DIR / MODEL_INT8)
     x = torch.from_numpy(feats[idx].astype(np.int64)).unsqueeze(1)
     ref_logits = torch.cat([int_forward(params, b) for b in x.split(512)]).tolist()
 

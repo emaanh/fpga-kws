@@ -104,14 +104,14 @@ def features_fixed(pcm: np.ndarray, mean: float, f_in: int, return_stages=False)
 
 if __name__ == "__main__":
     # Compare against the float frontend + input quantization on the test set.
-    from .config import CKPT_DIR
+    from .config import CKPT_DIR, MODEL_FLOAT, MODEL_INT8
     from .data import CACHE_DIR
     from .features import LogMel
     from .quant import int_forward, quantize_input
 
-    params = torch.load(CKPT_DIR / "dscnn_int8.pt")
+    params = torch.load(CKPT_DIR / MODEL_INT8)
     frontend = LogMel()
-    frontend.load_state_dict(torch.load(CKPT_DIR / "dscnn_float.pt")["frontend"])
+    frontend.load_state_dict(torch.load(CKPT_DIR / MODEL_FLOAT, map_location="cpu")["frontend"])
     d = np.load(CACHE_DIR / "test.npz")
     audio, labels = d["audio"], d["labels"]
     keep = labels != 1  # keywords only: a fair spot check that needs no silence synthesis

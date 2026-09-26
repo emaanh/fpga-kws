@@ -2,8 +2,8 @@
 
 set_property -dict { PACKAGE_PIN E3  IOSTANDARD LVCMOS33 } [get_ports { clk }]
 create_clock -period 10.000 -name board_clk [get_ports { clk }]
-# The design runs on the board clock divided by 2 (kws_top SYS_DIV).
-create_clock -period 20.000 -name sys_clk [get_nets { sys_clk }]
+# The design runs on the board clock divided by 10 (kws_top SYS_DIV).
+create_clock -period 100.000 -name sys_clk [get_nets { sys_clk }]
 
 set_property -dict { PACKAGE_PIN C12 IOSTANDARD LVCMOS33 } [get_ports { rst_n }]
 

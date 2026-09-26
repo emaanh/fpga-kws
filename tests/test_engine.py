@@ -1,8 +1,11 @@
-"""cocotb tests for rtl/kws_engine.sv against the integer reference in python/kws/quant.py.
+"""cocotb tests for rtl/kws_engine.sv against the streaming integer reference
+(python/kws/quant.py stream_forward).
 
-    uv run pytest tests/test_engine.py                     # per-layer check on a few clips
-    KWS_N_CLIPS=200 uv run pytest tests/test_engine.py     # more clips (logits/class only)
-    KWS_N_CLIPS=all uv run pytest tests/test_engine.py     # whole test set (~1 h)
+Feeds test-set feature frames as a continuous stream and checks every result that covers a
+whole window, logits and all, then restarts and checks a second stream.
+
+    uv run pytest tests/test_engine.py
+    KWS_N_CLIPS=20 uv run pytest tests/test_engine.py     # a longer stream
 
 Needs `uv run python -m kws.export` first (ROMs + test features).
 """
@@ -18,103 +21,122 @@ from cocotb.clock import Clock
 from cocotb.triggers import ClockCycles, RisingEdge
 
 ROOT = Path(__file__).resolve().parents[1]
-N_LAYER_CHECK_CLIPS = 4  # clips that also get every layer's output compared
 
 
 def load_reference():
-    from kws.export import pack_acts
+    """(test features (N, 49, 40), labels, window reference feat -> logits)."""
+    from kws.config import CKPT_DIR, MODEL_INT8, VEC_DIR
     from kws.quant import int_forward
 
-    params = torch.load(ROOT / "checkpoints" / "dscnn_int8.pt")
-    feats = np.fromfile(ROOT / "build" / "vectors" / "test_features.bin", np.int8).reshape(-1, 49, 40)
-    labels = np.fromfile(ROOT / "build" / "vectors" / "test_labels_preds.bin", np.uint8).reshape(-1, 2)[:, 0]
+    params = torch.load(CKPT_DIR / MODEL_INT8)
+    feats = np.fromfile(VEC_DIR / "test_features.bin", np.int8).reshape(-1, 49, 40)
+    labels = np.fromfile(VEC_DIR / "test_labels_preds.bin", np.uint8).reshape(-1, 2)[:, 0]
 
     def reference(feat):
         x = torch.from_numpy(feat.astype(np.int64)).view(1, 1, 49, 40)
-        logits, acts, pooled = int_forward(params, x, return_acts=True)
-        words = [[int.from_bytes(row.astype(np.uint8).tobytes(), "little") for row in pack_acts(a[0])]
-                 for a in acts]
-        return logits[0].tolist(), words, pooled[0].tolist()
+        return int_forward(params, x)[0].tolist()
 
     return feats, labels, reference
 
 
-def pick_clips(n_total):
-    n = os.environ.get("KWS_N_CLIPS", "8")
-    if n == "all":
-        return list(range(n_total))
-    return np.linspace(0, n_total - 1, int(n)).astype(int).tolist()
+def make_stream(feats, first, n_clips):
+    """Back-to-back test clips as one feature stream, and its streaming reference logits."""
+    from kws.config import CKPT_DIR, MODEL_INT8
+    from kws.quant import stream_forward
+
+    params = torch.load(CKPT_DIR / MODEL_INT8)
+    idx = np.linspace(first, len(feats) - 1, n_clips).astype(int)
+    q = np.concatenate([feats[i] for i in idx]).astype(np.int64)
+    return q, stream_forward(params, q).tolist()
 
 
-async def run_clip(dut, feat):
-    for addr, v in enumerate(feat.flatten()):
+async def feed_frame(dut, frame):
+    for band, v in enumerate(frame):
         dut.feat_we.value = 1
-        dut.feat_waddr.value = addr
+        dut.feat_band.value = band
         dut.feat_wdata.value = int(v) & 0xFF
         await RisingEdge(dut.clk)
     dut.feat_we.value = 0
-    dut.start.value = 1
+    dut.frame_end.value = 1
     await RisingEdge(dut.clk)
-    dut.start.value = 0
+    dut.frame_end.value = 0
 
 
-def read_buffer(mem, n_words):
-    return [int(mem[i].value) for i in range(n_words)]
+async def run_stream(dut, q, expected, label):
+    """Restart, feed q frame by frame like live mode, check every full result."""
+    results, partial, cycles = [], 0, []
+
+    async def watch():
+        nonlocal partial
+        while True:
+            await RisingEdge(dut.busy)
+            t0 = cocotb.utils.get_sim_time("ns")
+            await RisingEdge(dut.done)
+            cycles.append(int((cocotb.utils.get_sim_time("ns") - t0) / 10))
+            await RisingEdge(dut.clk)  # outputs are registered with done
+            if int(dut.full.value):
+                results.append(([dut.logits[k].value.to_signed() for k in range(len(expected[0]))],
+                                int(dut.class_idx.value), dut.margin.value.to_signed()))
+            else:
+                partial += 1
+
+    dut.restart.value = 1
+    await RisingEdge(dut.clk)
+    dut.restart.value = 0
+    watcher = cocotb.start_soon(watch())
+    for frame in q:
+        await feed_frame(dut, frame)
+        # Like live mode: the next frame only comes once the engine has caught up.
+        await ClockCycles(dut.clk, 2)
+        while int(dut.pending.value) or int(dut.busy.value):
+            await RisingEdge(dut.clk)
+    await ClockCycles(dut.clk, 10)
+    watcher.cancel()
+
+    assert partial == 19, f"{label}: {partial} results before the first full window, expected 19"
+    assert len(results) == len(expected), f"{label}: {len(results)} results, expected {len(expected)}"
+    for k, ((logits, cls, margin), ref) in enumerate(zip(results, expected)):
+        assert logits == ref, f"{label} result {k}: logits {logits} != {ref}"
+        top = sorted(ref, reverse=True)
+        assert cls == int(np.argmax(ref)), f"{label} result {k}: class {cls}"
+        assert margin == top[0] - top[1], f"{label} result {k}: margin {margin}"
+    dut._log.info(f"{label}: {len(results)} results bit-exact, {min(cycles)}..{max(cycles)} "
+                  f"cycles per step")
 
 
 @cocotb.test()
-async def test_clips(dut):
-    feats, labels, reference = load_reference()
+async def test_stream(dut):
+    feats, _, _ = load_reference()
     Clock(dut.clk, 10, unit="ns").start()
     dut.rst.value = 1
+    dut.restart.value = 0
     dut.feat_we.value = 0
-    dut.start.value = 0
+    dut.frame_end.value = 0
     await ClockCycles(dut.clk, 5)
     dut.rst.value = 0
     await RisingEdge(dut.clk)
 
-    clips = pick_clips(len(feats))
-    correct = 0
-    for n, idx in enumerate(clips):
-        logits_ref, words_ref, pooled_ref = reference(feats[idx])
-        await run_clip(dut, feats[idx])
-        start_time = cocotb.utils.get_sim_time("ns")
-
-        if n < N_LAYER_CHECK_CLIPS:
-            for layer, expected in enumerate(words_ref):
-                await RisingEdge(dut.layer_done)
-                mem = (dut.u_act_a if layer % 2 == 0 else dut.u_act_b).g_auto.mem
-                got = read_buffer(mem, len(expected))
-                bad = [i for i, (g, e) in enumerate(zip(got, expected)) if g != e]
-                assert not bad, (f"clip {idx} layer {layer}: {len(bad)} words differ, first at "
-                                 f"{bad[0]}: got {got[bad[0]]:032x} expected {expected[bad[0]]:032x}")
-
-        await RisingEdge(dut.done)
-        cycles = int((cocotb.utils.get_sim_time("ns") - start_time) / 10)
-        logits = [dut.logits[k].value.to_signed() for k in range(len(logits_ref))]
-        pooled = [int(dut.pooled[i // 16][i % 16].value) for i in range(64)]
-        assert pooled == pooled_ref, f"clip {idx}: pooled sums differ"
-        assert logits == logits_ref, f"clip {idx}: logits {logits} != {logits_ref}"
-        pred = int(dut.class_idx.value)
-        assert pred == int(np.argmax(logits_ref)), f"clip {idx}: class {pred}"
-        correct += pred == labels[idx]
-        if n < N_LAYER_CHECK_CLIPS or n % 50 == 0:
-            dut._log.info(f"clip {idx}: class {pred} (label {labels[idx]}), {cycles} cycles")
-
-    dut._log.info(f"{len(clips)} clips bit-exact; accuracy {correct / len(clips):.4f}")
+    n = int(os.environ.get("KWS_N_CLIPS", "3"))
+    q, expected = make_stream(feats, 0, n)
+    await run_stream(dut, q, expected, f"stream of {n} clips")
+    # A restart must forget the first stream completely.
+    q, expected = make_stream(feats, 7, 2)
+    await run_stream(dut, q, expected, "second stream after a restart")
 
 
 def test_engine():
     from cocotb_tools.runner import get_runner
 
+    from kws.config import GEN_DIR
+
     runner = get_runner("verilator")
     runner.build(
-        sources=[ROOT / "rtl/gen/kws_pkg.sv", ROOT / "rtl/sdp_ram.sv", ROOT / "rtl/kws_engine.sv"],
+        sources=[GEN_DIR / "kws_pkg.sv", ROOT / "rtl/sdp_ram.sv", ROOT / "rtl/kws_engine.sv"],
         hdl_toplevel="kws_engine",
         build_dir=ROOT / "build" / "sim_engine",
         always=True,
         build_args=["--public-flat-rw", "-Wno-fatal", "-Wno-WIDTHEXPAND", "-Wno-UNUSEDSIGNAL",
-                    f'-DKWS_MEM_DIR="{ROOT}/rtl/gen/"'],
+                    f'-DKWS_MEM_DIR="{GEN_DIR}/"'],
     )
     runner.test(hdl_toplevel="kws_engine", test_module="test_engine",
                 test_dir=Path(__file__).parent, build_dir=ROOT / "build" / "sim_engine")

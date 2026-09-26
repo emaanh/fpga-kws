@@ -8,19 +8,19 @@ Number format (everything the RTL has to implement):
   - Activations after ReLU: uint8, value = q * 2^-f_out.
   - Requantization: y = clamp((acc + 2^(s-1)) >> s, 0, 255) with s = f_in + fw[c] - f_out,
     i.e. a per-channel right shift with round-half-up. No multipliers.
-  - Global average pool is a plain sum (the /500 folds into the FC bias).
+  - Global average pool is a plain sum (the 1/(rows*cols) folds into the FC bias).
   - FC: int8 weights with one scale for all classes, so the integer logits are
     comparable and argmax needs no rescaling.
 """
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn
 
+from .config import N_FRAMES, N_MELS
 from .features import LogMel
 from .model import DSCNN
-
-POOL_SIZE = 25 * 20  # spatial size entering global average pool
 
 
 def fake_quant(x, scale, lo, hi):
@@ -80,6 +80,9 @@ class QDSCNN(nn.Module):
         self.fc_bias = nn.Parameter(model.fc.bias.detach().clone())
         self.register_buffer("f_in", torch.tensor(0.0))
         self.quant = False
+        with torch.no_grad():  # spatial size entering the global average pool
+            dev = model.fc.weight.device
+            self.pool_size = model.blocks(model.stem(torch.zeros(1, 1, N_FRAMES, N_MELS, device=dev))).shape[2:].numel()
 
     def features(self, audio):
         """Mean-subtracted log2 mel, (B, 1, 49, 40)."""
@@ -100,7 +103,7 @@ class QDSCNN(nn.Module):
         if self.quant:
             fw = weight_frac(w).min()  # one scale for all classes
             w = fake_quant(w, 2.0 ** fw, -128, 127)
-            b = fake_quant(b, POOL_SIZE * 2.0 ** (f + fw), -(2**31), 2**31 - 1)
+            b = fake_quant(b, self.pool_size * 2.0 ** (f + fw), -(2**31), 2**31 - 1)
         logits = F.linear(pooled, w, b)
         return (logits, acts) if return_acts else logits
 
@@ -143,7 +146,7 @@ class QDSCNN(nn.Module):
             "mean": float(self.frontend.mean),
             "layers": layers,
             "fc_w": torch.floor(self.fc_weight * 2.0**fw + 0.5).clamp(-128, 127).to(torch.int8).cpu(),
-            "fc_b": torch.floor(self.fc_bias * POOL_SIZE * 2.0 ** (f + fw) + 0.5).to(torch.int32).cpu(),
+            "fc_b": torch.floor(self.fc_bias * self.pool_size * 2.0 ** (f + fw) + 0.5).to(torch.int32).cpu(),
         }
 
 
@@ -152,9 +155,8 @@ def quantize_input(features, f_in):
     return torch.clamp(torch.floor(features * 2.0**f_in + 0.5), -128, 127).to(torch.int64)
 
 
-def int_forward(params, x, return_acts=False):
-    """Integer-only inference. x: int64 (B, 1, 49, 40) in int8 range. Returns int64 logits,
-    plus (per-layer outputs, pooled sums) if `return_acts`.
+def int_convs(params, x):
+    """The integer conv layers on x (int64, (B, 1, H, 40)). Returns every layer's output.
 
     Convs run in float64 on CPU, which is exact here (|acc| < 2^53)."""
     x = x.cpu()
@@ -167,9 +169,61 @@ def int_forward(params, x, return_acts=False):
         assert (s >= 1).all(), "left shifts not expected"
         x = ((acc + (torch.ones_like(s) << (s - 1))) >> s).clamp(0, 255)  # ReLU folded into the lower clamp
         acts.append(x)
-    pooled = x.sum((2, 3))
+    return acts
+
+
+def int_forward(params, x, return_acts=False):
+    """Integer-only inference. x: int64 (B, 1, 49, 40) in int8 range. Returns int64 logits,
+    plus (per-layer outputs, pooled sums) if `return_acts`."""
+    acts = int_convs(params, x)
+    pooled = acts[-1].sum((2, 3))
     logits = pooled @ params["fc_w"].to(torch.int64).T + params["fc_b"].to(torch.int64)
     return (logits, acts, pooled) if return_acts else logits
+
+
+def is_streaming(params):
+    """True for models without padding along time (see model.py)."""
+    return all(p["padding"][0] == 0 for p in params["layers"])
+
+
+def pool_rows(params, n_frames=N_FRAMES):
+    """Rows of the last layer for an n_frames window."""
+    rows = n_frames
+    for p in params["layers"]:
+        kh, sh, ph = p["w"].shape[2], p["stride"][0], p["padding"][0]
+        rows = (rows + 2 * ph - kh) // sh + 1
+    return rows
+
+
+def stream_forward(params, q):
+    """Integer logits of a streaming model over a long feature stream q (int, (T, 40)).
+
+    Result k is the window of frames 2k .. 2k+48, i.e. one result every 2 frames. With no
+    padding along time, each layer's rows over the whole stream are the rows every window
+    sees, so this equals int_forward on each window exactly. It is also what the streaming
+    engine computes: one new row per layer every 2 frames, and the pool as a sum of the
+    last pool_rows() rows of the last layer."""
+    assert is_streaming(params)
+    x = torch.as_tensor(q, dtype=torch.int64)[None, None]
+    rowsum = int_convs(params, x)[-1][0].sum(2)            # (64, rows)
+    pooled = rowsum.unfold(1, pool_rows(params), 1).sum(2)  # (64, results)
+    return pooled.T @ params["fc_w"].to(torch.int64).T + params["fc_b"].to(torch.int64)
+
+
+def logits_over_time(params, q, every=5):
+    """Integer logits over a feature stream q (T, 40), as the board computes them.
+
+    Returns (end frame of each window, logits). A streaming model gives a result every 2
+    frames; an older full-window model is run on a window every `every` frames."""
+    q = np.asarray(q)
+    if is_streaming(params):
+        logits = stream_forward(params, q)
+        return 2 * np.arange(len(logits)) + N_FRAMES - 1, logits
+    ends = np.arange(N_FRAMES, len(q) + 1, every)
+    if len(ends) == 0:
+        return ends - 1, torch.zeros(0, params["fc_w"].shape[0], dtype=torch.int64)
+    x = torch.from_numpy(np.stack([q[k - N_FRAMES : k] for k in ends]).astype(np.int64)).unsqueeze(1)
+    return ends - 1, torch.cat([int_forward(params, b) for b in x.split(256)])
 
 
 def describe(params):

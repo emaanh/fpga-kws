@@ -30,7 +30,7 @@ module mic_fir
   logic [$clog2(FIR_D)-1:0] phase;
 
   sdp_ram #(.WIDTH(24), .DEPTH(256)) u_hist (
-    .clk, .we(in_valid), .waddr(wptr), .wdata(in_data), .raddr(rd_idx), .rdata(sample));
+    .clk, .we(in_valid), .waddr(wptr), .wdata(in_data), .re(busy), .raddr(rd_idx), .rdata(sample));
 
   // MAC sequencer
   logic [7:0]  tap;
@@ -41,7 +41,7 @@ module mic_fir
   logic signed [39:0] acc;
 
   sdp_ram #(.WIDTH(18), .DEPTH(FIR_TAPS), .INIT({MEM_DIR, "fe_fir.hex"}), .STYLE("block")) u_taps (
-    .clk, .we(1'b0), .waddr('0), .wdata('0), .raddr(tap), .rdata(coef));
+    .clk, .we(1'b0), .waddr('0), .wdata('0), .re(busy), .raddr(tap), .rdata(coef));
 
   assign rd_idx = newest - tap;
 

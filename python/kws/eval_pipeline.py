@@ -15,7 +15,7 @@ from concurrent.futures import ProcessPoolExecutor
 import numpy as np
 import torch
 
-from .config import CKPT_DIR, CLASSES
+from .config import CKPT_DIR, CLASSES, MODEL_FLOAT, MODEL_INT8
 from .data import Split
 from .features import LogMel
 from .fixed_frontend import features_fixed
@@ -35,8 +35,8 @@ def main():
     p.add_argument("--level-db", type=float, default=-36.0, help="speech level at the mic, dBFS")
     p.add_argument("--gain", type=int, default=6, help="mic path gain step (6 dB each)")
     p.add_argument("--n", type=int, help="limit to n clips")
-    p.add_argument("--int8", default="dscnn_int8.pt")
-    p.add_argument("--float-ckpt", default="dscnn_float.pt", help="for the float frontend's stats")
+    p.add_argument("--int8", default=MODEL_INT8)
+    p.add_argument("--float-ckpt", default=MODEL_FLOAT, help="for the float frontend's stats")
     p.add_argument("--mic-only", action="store_true")
     args = p.parse_args()
 

@@ -3,6 +3,11 @@
 Only conv / depthwise conv / pointwise conv / BN / ReLU / global average pool / FC,
 so every layer is straightforward to implement in RTL. BN folds into the conv
 weights before export.
+
+Streaming variant: no padding along time, so each output row depends only on real input
+frames. A new stem row every 2 frames then needs just one new row per layer, and the
+hardware can keep the older rows instead of recomputing the whole 1 s window
+(quant.stream_forward). The frequency axis keeps its padding.
 """
 
 from torch import nn
@@ -21,11 +26,11 @@ def conv_bn(c_in, c_out, k, stride=1, padding=0, groups=1):
 class DSCNN(nn.Module):
     def __init__(self, channels=64, n_blocks=4, n_classes=len(CLASSES)):
         super().__init__()
-        # Input (1, 49, 40) -> (64, 25, 20)
-        self.stem = conv_bn(1, channels, (10, 4), stride=2, padding=(5, 1))
+        # Input (1, 49, 40) -> (64, 20, 20); each depthwise layer then drops 2 rows: 12 at the pool
+        self.stem = conv_bn(1, channels, (10, 4), stride=2, padding=(0, 1))
         self.blocks = nn.Sequential(*[
             nn.Sequential(
-                conv_bn(channels, channels, 3, padding=1, groups=channels),  # depthwise
+                conv_bn(channels, channels, 3, padding=(0, 1), groups=channels),  # depthwise
                 conv_bn(channels, channels, 1),                              # pointwise
             )
             for _ in range(n_blocks)

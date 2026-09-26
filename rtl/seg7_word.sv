@@ -3,7 +3,9 @@
 // Segments and anodes are active low. seg = {g, f, e, d, c, b, a}.
 module seg7_word
   import kws_pkg::*;
-(
+#(
+  parameter int SCAN_BITS = 14  // one digit every 2^SCAN_BITS clocks
+) (
   input  logic       clk,
   input  logic       show,        // blank the display until the first result
   input  logic [3:0] class_idx,
@@ -48,15 +50,15 @@ module seg7_word
     endcase
   endfunction
 
-  // Scan one digit every 2^14 cycles (~6 kHz at 100 MHz, ~760 Hz per digit).
+  // Scan one digit every 2^SCAN_BITS cycles (2^13 at 10 MHz: ~1.2 kHz, ~150 Hz per digit).
   // Registered step by step (word, character, glyph): the display has time, the clock doesn't.
-  logic [16:0] scan;
+  logic [SCAN_BITS+2:0] scan;
   logic [2:0]  digit, digit_q;
   logic [63:0] text;
   logic [7:0]  ch;
   logic        show_q, show_qq;
 
-  assign digit = scan[16:14];
+  assign digit = scan[SCAN_BITS+2:SCAN_BITS];
 
   always_ff @(posedge clk) begin
     scan    <= scan + 1'b1;
