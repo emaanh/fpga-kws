@@ -21,9 +21,6 @@ I did keyword spotting on a Digilent Nexys A7-100T, designing a pipeline to
 Categories/Words: Emaan, Heidari, yes, no, up, down, left, right, on, off, stop, go, *silence, *unknown
 \* = not displayed
 
-## Demo
-coming soon I need to borrow Josh's FPGA again lmao
-
 ## Results
 
 | Pipeline | Test accuracy |
